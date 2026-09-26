@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+results/
+runs/
+logs/
+*.pt
+*.onnx
+*_openvino_model/
+.DS_Store
+weights/
+models/

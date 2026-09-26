@@ -47,13 +47,17 @@ AXES = {
 
 # ------------------------------------------------------------------ recording (background threads)
 def log_state(tello, rec, stop):
-    """Store every new state packet with the time djitellopy received it."""
+    """Store every new state packet with the time we first saw it.
+
+    djitellopy (2.5) replaces the whole state dict per packet and does not timestamp it, so we poll at
+    ~500 Hz and stamp on arrival: <= 2 ms of jitter, well under the ~100 ms state period.
+    """
     last = None
     while not stop.is_set():
         st = tello.get_current_state()
-        if st and st is not last and "received_at" in st:
+        if st and st is not last:
             last = st
-            rec["state"].append([st["received_at"].timestamp()] + [float(st.get(k, "nan")) for k in FIELDS])
+            rec["state"].append([time.time()] + [float(st.get(k, "nan")) for k in FIELDS])
         time.sleep(0.002)
 
 

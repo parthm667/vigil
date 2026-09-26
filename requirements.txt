@@ -1,0 +1,9 @@
+# ReachGlass laptop-side dependencies. Install into the project venv:
+#   python3.12 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+numpy>=1.26
+opencv-python>=4.9        # camera (Tello UDP via FFmpeg), colour-blob detector, GUI
+djitellopy>=2.5           # Tello commands + state stream
+ultralytics>=8.3          # YOLO person / object detection (pulls in torch)
+pytest>=8                 # tests
+transformers>=4.45        # Depth-Anything-V2 monocular depth (free space during exploration)
+clip @ git+https://github.com/ultralytics/CLIP.git   # YOLO-World open-vocabulary text encoder

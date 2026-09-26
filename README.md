@@ -1,1 +1,163 @@
-Initial commit!
+# ReachGlass: scout-drone perception and mission stack
+
+A DJI Tello (standard model) hovers **behind and above the wearer's head**. When it gets a text request
+("can you find my water bottle?") it drops to search height, explores the room, finds the object, flies
+up to it, and works out where the object is **relative to where the person stood and which way they faced**.
+That result is the input to the next stage: guiding the person with the glasses.
+
+Until the bottle model is trained, the team's **blue water bottle** (24 cm tall, 9 cm wide, black cap) is
+the dummy. It is found by its colour (hue 100-122, measured from a photo) and reported as `bottle`, so
+"find my water bottle" works end to end today. The colour detector sees only the blue body (0.19 m), not
+the cap. A YOLO-World alternative that boxes the whole bottle is ready in `site.yaml`.
+
+## 1. Setup (once per laptop)
+
+```bash
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python tools/download_models.py        # YOLO (+pose, +World), Depth-Anything; test-runs each one
+python -m pytest                        # ~200 tests, ~4 min (unit tests + closed-loop simulations)
+```
+
+## 2. See the whole mission on the simulator (no drone)
+
+```bash
+python -m reachglass sim --query "can you find my water bottle" --at 25
+```
+
+The dashboard shows the drone camera with detections, a live map and the mission state. You can also type
+requests in the terminal: `find my water bottle`, `follow me`, `what's around me`, `stop`, `land`.
+Add `--headless --record run.mp4` to save a video instead of opening a window.
+
+The simulator renders the room, and the **real** colour-blob detector finds the dummy in those frames. People
+and furniture come from "oracle" detectors (YOLO cannot recognise rendered boxes), with realistic faults:
+noise, dropouts, and left/right keypoint swaps.
+
+## 3. On site, before the first flight (about 20 minutes)
+
+1. **Latency / sign check.** Run `python tools/tello_latency_test.py --ground`, then the flight version.
+   - Set `drone.video_lag_s` to the measured video delay plus a margin. After a turn or move, frames are only
+     used once they are guaranteed to show the new view.
+   - Note whether telemetry `yaw` grows with `cw`. The stack also checks this on its first clean 20-135 deg
+     rotation and flips it if needed.
+   - Note the sign of `pitch` when the drone speeds up forward (nose down). If forward acceleration gives
+     **negative** pitch, set `perception.pitch_sign: 1`.
+2. **Focal length** (every distance depends on it). Place the dummy at a taped 2.0 m and run:
+   `python -m reachglass.tools.calibrate_camera tello --height 0.19 --distance 2.0 --auto` (0.19 m = the
+   bottle's blue body, which is what `--auto` measures)
+   Repeat at 1.5 m and 3 m, then paste the median `fx/fy` into your config.
+3. **Dummy colour.** Run `python -m reachglass.tools.hsv_picker tello` and click the dummy **in every lighting
+   you will fly in** (room lights on, daylight by the window, its shadow side): each click widens the range to
+   cover all of them (`c` clears). Check that **nothing else** in the room lights up in the mask, then press `p`
+   and paste the printed `hsv_ranges` into `site.yaml`. Room lights barely move a saturated colour's hue;
+   **dim** light lowers its brightness (V, already down to 70 for the bottle's shadow side). Large blue
+   surfaces (a blue couch, wall, poster, bus through a window) will show up too: move them or check that
+   the mask ignores them. Blue jeans/shirts are dropped when they are inside a detected person's box.
+4. **Wearer height, to +-2 cm (with shoes).** Set `perception.person_height_m` and `person_height_sd_m: 0.02`.
+   1 m behind at 2 m, only the head is in frame and the distance comes from how far below the camera it is
+   (0.25 m): 5 cm of height error is up to 25 % of distance, 2 cm stays under 10 %. `follow.altitude_m` must be
+   at least that height + 0.2 m (the config refuses anything else), so above 1.80 m raise it (e.g. 2.05).
+5. **Dry run.** `python -m reachglass tello --dry-run` (or `drone: {kind: dry_run}` in the config) connects,
+   streams video and reads telemetry, but **sends no motion commands**. Type `takeoff`, then hold the drone
+   1 m behind the wearer at 2 m high and check the dashboard: is the person detected from just their head,
+   is the range right, and what commands it *would* send (they appear in the log). `--no-takeoff` (start straight in FOLLOW) is only
+   accepted together with a dry run.
+6. **Fly.** `python -m reachglass tello`. **Take off from the floor**: altitude limits are measured from
+   the takeoff surface. Nothing happens until you type `takeoff` or press `t` in the dashboard, so check
+   that the person is detected first. Use a clear room, prop guards, and a spotter.
+   Keys: `t` = takeoff, SPACE = hold/resume, `l` = land, `e` = EMERGENCY motor stop, `q` = land and quit,
+   Ctrl+C = land. A land whose reply is lost is re-sent every 2 s until the drone is down.
+
+Example `site.yaml` (use it with `--config site.yaml`):
+```yaml
+camera: {fx: 918, fy: 918}
+drone: {video_lag_s: 0.25}
+perception:
+  person_height_m: 1.78
+  person_height_sd_m: 0.02
+  pitch_sign: 1
+  object_heights_m: {bottle: 0.19}      # blue part of the dummy bottle (0.24 with a YOLO model)
+  object_widths_m: {bottle: 0.09}
+  target_detector:
+    params: {hsv_ranges: [[100, 100, 70, 122, 255, 255]]}
+follow: {altitude_m: 2.0, distance_m: 1.0}
+safety: {max_altitude_m: 2.3}           # below your ceiling
+```
+
+## 4. Sending requests from the voice app
+
+Every line typed in the terminal is a request. The STT/voice team can also send UTF-8 UDP datagrams to
+port 5005:
+```python
+import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"find my water bottle", ("127.0.0.1", 5005))
+```
+Requests are parsed to a **constrained** intent and target. The target is always a class the detectors can
+actually find, so an unknown object gets "I can't look for keys yet" instead of an invented one.
+`query.LLMQueryParser` plugs in any language model (Grok, etc.) behind the same interface and rejects
+answers outside the vocabulary.
+
+## 5. Swapping in the trained bottle model (tomorrow)
+
+```yaml
+perception:
+  target_detector:
+    kind: yolo
+    params: {weights: models/bottle.pt, classes: [bottle], conf: 0.4, rename: {water_bottle: bottle}}
+  object_heights_m: {bottle: 0.24}      # a YOLO box covers the whole bottle, cap included
+  object_widths_m: {bottle: 0.09}
+```
+Nothing else changes. Stock COCO YOLO does **not** reliably call this bottle a bottle (on the photo:
+`yolo11n` "cup" 0.27, `yolo11s` "vase" 0.44 / "bottle" 0.26). YOLO-World prompted with "blue water bottle"
+does (0.94): see `site.yaml`, and time it on the demo laptop first (~180 ms/frame on a CPU).
+
+## 6. How it works (and what to swap)
+
+| Module | What it does | Swap / tune |
+|---|---|---|
+| `sources/` | Newest-frame video: the team's low-latency Tello reader (auto-reconnect on Wi-Fi drops), webcam, files | `TelloVideoSource(fps=60)` |
+| `detect/` | `ColorBlobDetector` (dummy), `UltralyticsDetector` (YOLO / pose / trained) | `perception.*_detector` |
+| `track/` | IoU tracker + target lock: confirms (3 hits or 1 plausible confident frame), never jumps to a twin, re-locks | `tracking.*` |
+| `person/` | Person range (fused: full height / head elevation / shoulders / width) and facing (0 = back to us) | priors in `perception.*` |
+| `perception.py` | Runs the right detectors per mode (follow / search / approach); person guard (blue jeans are not the bottle); object range from size priors | `perception.stride` |
+| `mapping/` | Odometry (yaw + commanded moves), coverage/obstacle grid with obstacle heights, semantic memory | `explore.*` |
+| `behaviors/` | `FollowBehind` (rc visual servo + orbit), `Scan`, `Explore` (scan-score-hop), `Approach`, `ReacquirePerson` | `follow.*`, `explore.*`, `approach.*` |
+| `mission/` | State machine, query inboxes, **guidance** (target vs the person: distance, turn, clock face) | |
+| `drone/` | `TelloDrone` (non-blocking commands, dry-run), `SafetyGovernor` (clamps, ceiling/floor, battery, stale video -> hover) | `safety.*` |
+| `sim/` | Renderer, Tello-like kinematics, walking person, oracle detectors, `SimRunner` | |
+
+Exploration: at each vantage point the drone scans 8 x 45 deg. It then scores directions:
+open x (0.3 + novelty) x semantic prior (bottles live on tables...) x people penalty x revisit penalty.
+Next it hops at most 1.5 m. Free space comes only from evidence: an object seen at 3 m proves the line
+of sight to it is clear. Unknown directions get a cautious 0.5 m step.
+
+## 7. Known limits (be honest in the demo)
+
+- **Walls are invisible** unless something is seen beyond them. There is no forward range sensor, and
+  monocular depth (Depth-Anything) proved unreliable here: it is kept as an experimental slot, off by default.
+  Hops are short and the room should be clear. Keep a spotter.
+- **Following 1 m behind at 2 m** (the default) sees only the wearer's **head**: the camera cannot tilt, and
+  their shoulders are 29 deg below its view. So there is no facing estimate and no orbiting behind them when
+  they turn, YOLO must recognise a person from the top of a head, and they drop out of view entirely when
+  closer than ~0.85 m. If they walk toward the drone it backs off, and if they vanish while close it backs
+  off sideways and climbs. `follow: {distance_m: 1.6}` puts the shoulders back in view (facing, orbit, more
+  margin) if the dry run shows head-only detection is unreliable.
+- **Person range** depends on the configured wearer height (see step 4). The follow controller only moves
+  toward the person when even the most conservative estimate agrees.
+- **Facing** comes from YOLO-pose's left/right shoulder labels, cross-checked with face visibility and
+  smoothed. Test it on the real wearer seen from behind (dry run) before relying on the orbit.
+- Target distance comes from its size: far away with its bottom hidden, it reads long. The approach
+  re-measures at every step, so it still arrives.
+- The Tello's downward sensor makes it hold height above whatever is below it. The stack uses
+  floor-referenced height for decisions, and treats furniture reaching within 0.2 m of flight height as an
+  obstacle (it passes over chair backs at 1.2 m, not over a TV on a stand). When furniture blocks the way it sidesteps, or stops
+  where the furniture allows.
+- People: the approach never flies within 1 m of a person. That includes where the wearer stood when they
+  asked, because the drone starts behind them and they are often between the drone and the target.
+
+## 8. Next stage: guiding the person
+
+`Mission.guidance` (see `mission/guidance.py`) holds the target and the person's position and heading in
+the mission frame. `guidance.relative_to(x, y, heading)` gives the distance and turn from the person's
+current pose as they walk. The drone can keep estimating that pose with the person estimator (it hovers
+next to the target facing the room). The glasses' L/R cues then come from that turn angle, plus the
+glasses camera once the target is in view.
