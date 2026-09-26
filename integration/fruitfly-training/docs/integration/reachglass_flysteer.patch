@@ -1,0 +1,435 @@
+diff --git a/README.md b/README.md
+index 446a304..8be99c5 100644
+--- a/README.md
++++ b/README.md
+@@ -161,3 +161,25 @@ the mission frame. `guidance.relative_to(x, y, heading)` gives the distance and
+ current pose as they walk. The drone can keep estimating that pose with the person estimator (it hovers
+ next to the target facing the room). The glasses' L/R cues then come from that turn angle, plus the
+ glasses camera once the target is in view.
++
++## 9. Optional: fruit fly steering
++
++The fruitfly-training team's connectome controller (`flyfollow.steer.FlySteer`, 1,446 LIF neurons from the
++fruit fly's pursuit circuit) can decide the **yaw stick** in FOLLOW and APPROACH. Everything else stays ours:
++perception, distance and altitude hold, orbit, lost-person search, the approach's discrete moves, and the
++`SafetyGovernor`, which still clamps every command. The default is unchanged (`steering: pid`).
++
++```bash
++pip install -e /path/to/fruitfly-training/third_party/FlyDrones -e /path/to/fruitfly-training   # into this venv
++```
++```yaml
++follow: {steering: fly}          # pid = our yaw law (the default)
++approach: {steering: fly}        # fly: continuous rc yaw onto the target instead of a discrete rotate
++fly:
++  params_path: /path/to/fruitfly-training/data/brains/trained/FLY-YAW_smooth_best.json   # "" = hand calibration
++  # deadband: 4, hysteresis: 3, slew: 300, smoothing_ms: 0   # stick smoothing (defaults shown)
++  # latency_s: 0.25                  # default: drone.video_lag_s
++  # viz: true                        # fly body + brain window: python -m flyfollow.viz.live --brain <npz>
++```
++If `flyfollow` is missing or the fly fails, the behaviour logs one warning and uses our yaw law.
++Details and sim numbers: `docs/integration/REACHGLASS.md` in fruitfly-training.
+diff --git a/reachglass/behaviors/approach.py b/reachglass/behaviors/approach.py
+index a1d61c0..4ffd46e 100644
+--- a/reachglass/behaviors/approach.py
++++ b/reachglass/behaviors/approach.py
+@@ -2,7 +2,9 @@
+ 
+ Each cycle (after the drone has settled and a fresh frame shows the target):
+   1. target sinking out of the bottom of the frame -> descend 20-30 cm (keeps a low object in view)
+-  2. |bearing| > align_deg                          -> rotate onto it
++  2. |bearing| > align_deg                          -> rotate onto it (approach.steering: fly -> the fruit fly
++                                                        controller turns onto it with continuous rc yaw; if it
++                                                        stops short, one discrete rotate trims the rest)
+   3. range > standoff + tolerance                   -> move forward min(range - standoff, max_step),
+                                                         never beyond the clearance proven along the way
+   4. otherwise                                      -> ARRIVED (SUCCESS); `final` holds the last observation
+@@ -15,8 +17,11 @@ import math
+ 
+ from ..config import ApproachCfg
+ from ..types import TargetObs
+-from .base import FAILURE, RUNNING, SUCCESS, Behavior, Ctx, Discrete
++from .base import FAILURE, RUNNING, SUCCESS, Behavior, Ctx, Discrete, clamp
+ from .explore import FOOTPRINT, observe
++from .fly_steer import FlyYaw
++
++FLY_ALIGN_TIMEOUT_S = 5.0  # fly alignment taking longer than this: the discrete rotate finishes the turn
+ 
+ 
+ def observe_people(ctx: Ctx) -> None:
+@@ -101,6 +106,10 @@ class Approach(Behavior):
+         self.final = None
+         self.last_seen: TargetObs | None = None
+         self.sidesteps = 0
++        self.fly = FlyYaw.for_behavior(ctx, "approach", self.c.standoff_m)  # None: discrete rotates
++        self.fly_align_t0: float | None = None
++        self.fly_ok = 0
++        self.fly_just_aligned = False  # the next alignment (if still needed) is a discrete rotate
+ 
+     def _issue(self, ctx: Ctx, cmd: Discrete, why: str) -> str:
+         self.cmd = cmd
+@@ -111,6 +120,8 @@ class Approach(Behavior):
+ 
+     def step(self, ctx: Ctx) -> str:
+         c = self.c
++        if self.fly is not None and self.fly_align_t0 is None:
++            self.fly.yaw(ctx.now)  # keep the brain ticking (no target input) while discrete moves own the drone
+         if self.cmd is not None:
+             r = self.cmd.step(ctx)
+             if r == RUNNING:
+@@ -121,6 +132,8 @@ class Approach(Behavior):
+             if failed:
+                 self.status = "move refused/failed: re-measuring"
+             return RUNNING
++        if self.fly_align_t0 is not None:
++            return self._fly_align(ctx)
+         if self.steps > c.max_steps:
+             self.status = "too many approach steps"
+             return FAILURE
+@@ -144,7 +157,14 @@ class Approach(Behavior):
+                 and self._safe_to_descend(ctx, alt - 0.25)):
+             return self._issue(ctx, Discrete("move", 25, "down"), "target low in the frame: descend 25 cm")
+         if abs(t.bearing_deg) > c.align_deg:
++            if self.fly is not None and not self.fly.failed and not self.fly_just_aligned:
++                self.steps += 1
++                self.fly_align_t0, self.fly_ok = ctx.now, 0
++                ctx.note(f"approach: fly steering onto the target ({t.bearing_deg:+.0f} deg)")
++                return self._fly_align(ctx)
++            self.fly_just_aligned = False
+             return self._issue(ctx, Discrete("rotate", t.bearing_deg), f"align {t.bearing_deg:+.0f} deg")
++        self.fly_just_aligned = False
+         r = t.range_m
+         if r is None:
+             # no size-based range (box cut by the frame edge): we are close; accept if it is big
+@@ -205,6 +225,32 @@ class Approach(Behavior):
+             return self._issue(ctx, Discrete("move", step * 100, "forward"), f"target {r:.2f} m: forward {step:.2f} m")
+         return self._arrive(ctx, t)
+ 
++    def _fly_align(self, ctx: Ctx) -> str:
++        """The fly turns the drone onto the target with rc yaw, until it is centred (within align_deg on 3
++        frames), lost for 0.5 s, or FLY_ALIGN_TIMEOUT_S passes. Then hover, settle, re-measure.
++        No range goes to the fly (as in follow): it sees the target at its standoff size (s = 1), where its
++        steering is calibrated; a bottle several metres away would look smaller than anything it trained on."""
++        t = ctx.res.target if (ctx.new_frame and ctx.res is not None) else None
++        if t is not None and t.confirmed:
++            self.last_seen = t
++            yaw = self.fly.yaw(ctx.now, t.bearing_deg, None, ctx.frame.t, fallback=clamp(t.bearing_deg, 20))
++            self.fly_ok = self.fly_ok + 1 if abs(t.bearing_deg) <= self.c.align_deg else 0
++            self.status = f"fly steering: target {t.bearing_deg:+.0f} deg, yaw {yaw:+.0f}"
++        else:
++            yaw = self.fly.yaw(ctx.now, fallback=0.0)
++        timeout = ctx.now - self.fly_align_t0 > FLY_ALIGN_TIMEOUT_S
++        if self.fly_ok >= 3 or timeout or self.fly.failed or not self.fly.target_valid:
++            ctx.drone.rc(0, 0, 0, 0)
++            self.fly_align_t0 = None
++            self.fly_just_aligned = True
++            ctx.cmd_done_t = ctx.now  # like a finished rotate: only frames after the turn (+ video lag) count
++            self.settle_until = ctx.now + self.settle_s
++            why = "centred" if self.fly_ok >= 3 else "timeout" if timeout else "target lost" if not self.fly.failed else "failed"
++            ctx.note(f"approach: fly steering done ({why})")
++            return RUNNING
++        ctx.drone.rc(0, 0, 0, int(yaw))
++        return RUNNING
++
+     # ------------------------------------------------------------------ keeping a low target in view
+     def _target_base_height(self, ctx: Ctx, t: TargetObs, r: float, alt: float) -> float:
+         """Height of the target's bottom above the floor, from its range and the elevation of its box bottom."""
+diff --git a/reachglass/behaviors/fly_steer.py b/reachglass/behaviors/fly_steer.py
+new file mode 100644
+index 0000000..dec17d8
+--- /dev/null
++++ b/reachglass/behaviors/fly_steer.py
+@@ -0,0 +1,81 @@
++"""Optional fruit fly steering for FOLLOW and APPROACH (follow.steering / approach.steering: fly).
++
++The fly (flyfollow.steer.FlySteer: a 1,446-neuron connectome circuit from the fruit fly brain) decides ONLY the
++yaw stick. Distance, altitude, orbit, lost-target search, the approach's discrete moves and the SafetyGovernor
++are unchanged, and every command still goes through ctx.drone (the governor).
++
++If flyfollow is not installed, the brain cannot be loaded, or FlySteer raises, the behaviour logs one warning
++and uses its own yaw law instead (for the rest of that behaviour, or of the run if loading failed).
++"""
++
++from __future__ import annotations
++
++import logging
++import math
++
++log = logging.getLogger("reachglass.fly")
++_SHARED: dict = {}  # one FlySteer per (params, brain, latency, viz) per process: the brain loads once
++_WARNED: set = set()
++
++
++def _warn_once(key: str, msg: str) -> None:
++    if key not in _WARNED:
++        _WARNED.add(key)
++        log.warning(msg)
++
++
++class FlyYaw:
++    """Per-behaviour handle on the shared FlySteer. Angles in degrees here (the stack's unit), + = right."""
++
++    def __init__(self, steer, max_rc_yaw: int):
++        self.steer = steer
++        self.max_rc_yaw = max_rc_yaw
++        self.failed = False
++
++    @classmethod
++    def for_behavior(cls, ctx, kind: str, z_ref_m: float) -> FlyYaw | None:
++        """A reset FlyYaw if `<kind>.steering` is "fly" and the fly loads, else None (use the PID law)."""
++        cfg = ctx.cfg
++        if getattr(cfg, kind).steering != "fly":
++            return None
++        fc = cfg.fly
++        latency = cfg.drone.video_lag_s if fc.latency_s is None else fc.latency_s
++        key = (fc.params_path, fc.brain_path, latency, fc.viz, fc.smoothing_ms, fc.deadband, fc.slew, fc.hysteresis)
++        try:
++            steer = _SHARED.get(key)
++            if steer is None:
++                from flyfollow.steer import FlySteer
++
++                steer = FlySteer(params_path=fc.params_path or None, brain_path=fc.brain_path or None,
++                                 max_yaw=fc.max_rc_yaw, latency_s=latency, viz=fc.viz,
++                                 smoothing_ms=fc.smoothing_ms, deadband=fc.deadband, slew=fc.slew,
++                                 hysteresis=fc.hysteresis)
++                _SHARED[key] = steer
++                log.info("fly steering loaded: %s", steer.stats)
++            steer.reset(z_ref_m=z_ref_m, kind=kind)  # fresh brain state + 1 s warmup (~35 ms)
++        except Exception as e:  # noqa: BLE001 (any failure: keep flying on the PID law)
++            _warn_once(f"load{key}", f"fly steering unavailable ({type(e).__name__}: {e}); using the PID yaw law")
++            return None
++        return cls(steer, fc.max_rc_yaw)
++
++    @property
++    def target_valid(self) -> bool:
++        """The fly still has a target (a detection in the last 0.5 s)."""
++        return (not self.failed) and bool(self.steer.target_valid)
++
++    def yaw(self, now: float, bearing_deg: float | None = None, range_m: float | None = None,
++            frame_t: float | None = None, fallback: float = 0.0) -> float:
++        """Yaw stick (+ = clockwise). Pass the bearing only for a detection on a NEW frame; call with no
++        bearing on other loops so the brain keeps ticking. Returns `fallback` if the fly has failed.
++        range_m sets the size the fly sees (z_ref / range); None = its standoff size, which follow and approach
++        use (in the sim: 6.4 deg RMS bearing error with None vs 9.4 with the person range)."""
++        if self.failed:
++            return fallback
++        try:
++            b = None if bearing_deg is None else math.radians(bearing_deg)
++            y = self.steer.yaw(now, b, range_m=range_m, t_frame=frame_t)
++            return float(max(-self.max_rc_yaw, min(self.max_rc_yaw, y)))
++        except Exception as e:  # noqa: BLE001
++            self.failed = True
++            _warn_once(f"run{id(self)}", f"fly steering failed ({type(e).__name__}: {e}); back to the PID yaw law")
++            return fallback
+diff --git a/reachglass/behaviors/follow.py b/reachglass/behaviors/follow.py
+index 0ebb365..78556da 100644
+--- a/reachglass/behaviors/follow.py
++++ b/reachglass/behaviors/follow.py
+@@ -18,10 +18,12 @@ from collections import deque
+ 
+ from ..config import FollowCfg
+ from .base import RUNNING, Behavior, Ctx, clamp, deadband
++from .fly_steer import FlyYaw
+ 
+ 
+ class FollowBehind(Behavior):
+     name = "follow"
++    fly: FlyYaw | None = None  # fruit fly yaw (follow.steering: fly), set in start(); None = the yaw law below
+ 
+     def __init__(self, cfg: FollowCfg):
+         super().__init__()
+@@ -37,6 +39,7 @@ class FollowBehind(Behavior):
+         self.last_bearing = 0.0
+ 
+     def start(self, ctx: Ctx) -> None:
++        self.fly = FlyYaw.for_behavior(ctx, "follow", self.c.distance_m)
+         ctx.perception.set_mode("follow")
+         self.ranges.clear()
+         self.facings.clear()
+@@ -89,6 +92,8 @@ class FollowBehind(Behavior):
+                 self.range_hist.append((ctx.now, r))
+             r_lo = min(v for v in (p.range_lo_m, r) if v is not None) if (p.range_lo_m or r) else None
+             yaw = clamp(deadband(p.bearing_deg, c.yaw_deadband_deg) * c.yaw_gain, c.max_rc_yaw)
++            if self.fly is not None:  # fly steering: replaces only this yaw value (no range: it steers at size s = 1)
++                yaw = clamp(self.fly.yaw(ctx.now, p.bearing_deg, None, ctx.frame.t, fallback=yaw), c.max_rc_yaw)
+             fwd, approaching = 0.0, False
+             width, height = ctx.res.image_size
+             too_big = p.det.w > self.max_box_width_frac * width
+@@ -140,7 +145,8 @@ class FollowBehind(Behavior):
+             ctx.drone.rc(*self.cmd)
+             self.status = "person close and out of view: backing off to the side"
+         elif unseen < 0.35:  # between frames: keep the last command
+-            ctx.drone.rc(*self.cmd[:2], ud, self.cmd[3])
++            yaw = self.cmd[3] if self.fly is None else int(clamp(self.fly.yaw(ctx.now, fallback=self.cmd[3]), c.max_rc_yaw))
++            ctx.drone.rc(*self.cmd[:2], ud, yaw)
+         elif unseen < 1.0:
+             ctx.drone.rc(0, 0, ud, 0)
+             self.status = "person briefly lost: holding"
+diff --git a/reachglass/config.py b/reachglass/config.py
+index 165dcd8..58f1fe4 100644
+--- a/reachglass/config.py
++++ b/reachglass/config.py
+@@ -127,6 +127,9 @@ class FollowCfg:
+     min_range_m: float = 0.55  # the most conservative distance cue below this: back off (and never approach)
+     max_box_width_frac: float = 0.75  # person box wider than this fraction of the frame: back off
+     search_yaw_rc: int = 20  # yaw speed when the person is lost
++    # who decides the yaw stick while the person is in view: "pid" (yaw_gain / yaw_deadband_deg above) or
++    # "fly" (the fruit fly connectome controller, see FlyCfg). Distance, altitude, orbit and safety are unchanged.
++    steering: str = "pid"
+ 
+ 
+ @dataclass
+@@ -162,6 +165,31 @@ class ApproachCfg:
+     min_step_m: float = 0.2  # Tello minimum move is 20 cm
+     reacquire_scan_deg: int = 30
+     max_steps: int = 20  # moves + turns + sidesteps + searches before giving up
++    # "pid": align with a discrete rotate by the bearing. "fly": the fruit fly controller turns onto the target
++    # with continuous rc yaw (see FlyCfg); forward moves, descents and sidesteps stay discrete.
++    steering: str = "pid"
++
++
++@dataclass
++class FlyCfg:
++    """Fruit fly steering (flyfollow.steer.FlySteer), used where follow.steering / approach.steering is "fly".
++
++    Needs the flyfollow package (pip install -e <fruitfly-training> and its third_party/FlyDrones). If it is
++    missing or fails, the behaviour logs a warning and uses its own yaw law instead.
++    """
++
++    # trainer best.json; recommended: <fruitfly-training>/data/brains/trained/FLY-YAW_smooth_best.json (trained, then
++    # fine-tuned for a smooth stick; FLY-YAW_best.json = trained, tracks tighter); "" = untrained hand calibration
++    params_path: str = ""
++    brain_path: str = ""  # pursuit subgraph .npz; "" = the one named in best.json, else flyfollow's default
++    latency_s: float | None = None  # capture -> frame arrival (s) its latency filter predicts across; None = drone.video_lag_s
++    max_rc_yaw: int = 40  # clamp on the fly's yaw stick (follow also applies follow.max_rc_yaw; safety.max_rc last)
++    # stick smoothing (spiking neurons make a noisy stick), measured on the sim (fruitfly-training REACHGLASS.md):
++    smoothing_ms: float = 0.0  # low-pass time constant (ms); 0 = off: 40 to 250 ms added lag and bearing error
++    deadband: float = 4.0  # subtracted from |yaw| (stick units), like follow.yaw_deadband_deg
++    slew: float = 300.0  # max stick change per second (0 = off); a safety cap, never reached in the sim
++    hysteresis: float = 3.0  # the stick only moves when the new value differs by more than this (removes dither)
++    viz: bool = False  # publish the fly body + brain view (run: python -m flyfollow.viz.live --brain <npz>)
+ 
+ 
+ @dataclass
+@@ -202,6 +230,7 @@ class Config:
+     follow: FollowCfg = field(default_factory=FollowCfg)
+     explore: ExploreCfg = field(default_factory=ExploreCfg)
+     approach: ApproachCfg = field(default_factory=ApproachCfg)
++    fly: FlyCfg = field(default_factory=FlyCfg)
+     safety: SafetyCfg = field(default_factory=SafetyCfg)
+     drone: DroneCfg = field(default_factory=DroneCfg)
+     mission: MissionCfg = field(default_factory=MissionCfg)
+@@ -292,6 +321,9 @@ def validate(cfg: Config) -> Config:
+         raise ValueError(f"follow.altitude_m ({f.altitude_m}) is above safety.max_altitude_m ({s.max_altitude_m})")
+     if cfg.explore.scan_altitude_m < s.min_altitude_m:
+         raise ValueError("explore.scan_altitude_m is below safety.min_altitude_m")
++    for name, sec in (("follow", f), ("approach", cfg.approach)):
++        if sec.steering not in ("pid", "fly"):
++            raise ValueError(f"{name}.steering must be 'pid' or 'fly', got {sec.steering!r}")
+     if t.max_age_s < t.lost_after_s:
+         raise ValueError("tracking.max_age_s must be >= tracking.lost_after_s (else re-locking a returning target fails)")
+     return cfg
+diff --git a/requirements.txt b/requirements.txt
+index f738d35..3ade965 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -7,3 +7,5 @@ ultralytics>=8.3          # YOLO person / object detection (pulls in torch)
+ pytest>=8                 # tests
+ transformers>=4.45        # Depth-Anything-V2 monocular depth (free space during exploration)
+ clip @ git+https://github.com/ultralytics/CLIP.git   # YOLO-World open-vocabulary text encoder
++# Optional fruit fly steering (follow.steering: fly), see README section 9:
++#   pip install -e /path/to/fruitfly-training/third_party/FlyDrones -e /path/to/fruitfly-training
+diff --git a/tests/test_fly_steer.py b/tests/test_fly_steer.py
+new file mode 100644
+index 0000000..79a1547
+--- /dev/null
++++ b/tests/test_fly_steer.py
+@@ -0,0 +1,89 @@
++"""Optional fruit fly steering (follow.steering / approach.steering: fly): config, fallback, closed loop."""
++
++import math
++import sys
++
++import pytest
++
++from reachglass.behaviors import fly_steer
++from reachglass.behaviors.base import Ctx
++from reachglass.behaviors.fly_steer import FlyYaw
++from reachglass.config import load_config
++
++try:
++    import flyfollow.steer  # noqa: F401
++
++    HAVE_FLY = True
++except Exception:  # noqa: BLE001
++    HAVE_FLY = False
++
++
++class _Ctx:
++    def __init__(self, cfg):
++        self.cfg = cfg
++
++
++def test_steering_defaults_to_pid_and_rejects_typos():
++    cfg = load_config()
++    assert cfg.follow.steering == "pid" and cfg.approach.steering == "pid" and cfg.fly.params_path == ""
++    cfg = load_config(overrides={"follow": {"steering": "fly"}, "fly": {"params_path": None, "latency_s": 0.3}})
++    assert cfg.follow.steering == "fly" and cfg.fly.params_path == "" and cfg.fly.latency_s == 0.3
++    assert cfg.fly.deadband > 0 and cfg.fly.hysteresis > 0 and cfg.fly.slew > 0  # stick smoothing on by default
++    with pytest.raises(ValueError):
++        load_config(overrides={"approach": {"steering": "brain"}})
++
++
++def test_pid_config_never_touches_the_fly():
++    assert FlyYaw.for_behavior(_Ctx(load_config()), "follow", 1.0) is None
++
++
++def test_missing_flyfollow_falls_back_to_pid(monkeypatch):
++    monkeypatch.setitem(sys.modules, "flyfollow.steer", None)  # import fails like an uninstalled package
++    monkeypatch.setattr(fly_steer, "_SHARED", {})
++    cfg = load_config(overrides={"follow": {"steering": "fly"}, "fly": {"brain_path": "not_installed.npz"}})
++    assert FlyYaw.for_behavior(_Ctx(cfg), "follow", 1.0) is None
++
++
++def test_fly_error_mid_flight_returns_the_pid_yaw():
++    class Broken:
++        target_valid = True
++
++        def yaw(self, *a, **k):
++            raise RuntimeError("boom")
++
++    f = FlyYaw(Broken(), 40)
++    assert f.yaw(1.0, 10.0, 1.0, 1.0, fallback=7.0) == 7.0 and f.failed
++    assert f.yaw(1.1, fallback=-3.0) == -3.0 and not f.target_valid
++
++
++@pytest.mark.skipif(not HAVE_FLY, reason="flyfollow (fruitfly-training) not installed")
++def test_fly_steers_follow_closed_loop():
++    from reachglass.behaviors.follow import FollowBehind
++    from reachglass.behaviors.loop import sense
++    from reachglass.perception import Perception
++    from reachglass.sim.drone_sim import SimDroneParams
++    from reachglass.sim.person_model import SimPerson
++    from reachglass.sim.scenario import Sim
++    from reachglass.sim.world import PersonScript, World
++
++    script = PersonScript([(0.0, 3.5, 3.6, 0.0)])  # standing, ~17 deg right of the drone's heading
++    w = World(size_x=9.0, size_y=8.0, boxes=[])
++    w.person = SimPerson(*script.at(0.0))
++    w.person_script = script
++    sim = Sim(w, (1.2, 3.0), 0.0, params=SimDroneParams(seed=0))
++    cfg = load_config(overrides={"follow": {"steering": "fly"}})
++    ctx = Ctx(cfg, sim.drone, Perception(cfg, sim.person_detector, None, None, sim.cam))
++    sim.drone.takeoff()
++    while sim.drone.busy():
++        sim.step(0.05)
++    beh = FollowBehind(cfg.follow)
++    beh.start(ctx)
++    assert beh.fly is not None
++    for _ in range(int(12.0 / (1.0 / 15))):
++        sim.step(1.0 / 15)
++        sense(ctx, sim.camera, sim.t)
++        beh.step(ctx)
++    p, d = sim.world.person, sim.drone.pos
++    bearing = (math.degrees(math.atan2(p.y - d[1], p.x - d[0])) - sim.drone.heading + 180) % 360 - 180
++    assert abs(bearing) < 12, (bearing, beh.status)  # turned onto the person (hand calibration holds ~5 deg left)
++    assert sim.drone.collisions == 0 and beh.fly.steer.stats["ticks"] > 150 and not beh.fly.failed

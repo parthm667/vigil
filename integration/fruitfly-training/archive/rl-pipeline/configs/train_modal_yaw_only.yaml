@@ -1,0 +1,11 @@
+# Yaw-only fly (audit fallback): the brain steers, the PID range loop sets forward speed.
+# Use with --label fly_yaw_only so it publishes to its own checkpoint folder.
+brain:
+  fly_forward: pid
+train:
+  popsize: 32
+  episodes_per_candidate: 8
+  approach_episodes: 3
+  generations: 150
+  selection_every: 10
+  selection_seeds: [1000, 1064]

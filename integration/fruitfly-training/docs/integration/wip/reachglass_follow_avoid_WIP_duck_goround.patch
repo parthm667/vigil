@@ -1,0 +1,2062 @@
+diff --git a/README.md b/README.md
+index 446a304..0ff86f2 100644
+--- a/README.md
++++ b/README.md
+@@ -120,7 +120,7 @@ does (0.94): see `site.yaml`, and time it on the demo laptop first (~180 ms/fram
+ | `person/` | Person range (fused: full height / head elevation / shoulders / width) and facing (0 = back to us) | priors in `perception.*` |
+ | `perception.py` | Runs the right detectors per mode (follow / search / approach); person guard (blue jeans are not the bottle); object range from size priors | `perception.stride` |
+ | `mapping/` | Odometry (yaw + commanded moves), coverage/obstacle grid with obstacle heights, semantic memory | `explore.*` |
+-| `behaviors/` | `FollowBehind` (rc visual servo + orbit), `Scan`, `Explore` (scan-score-hop), `Approach`, `ReacquirePerson` | `follow.*`, `explore.*`, `approach.*` |
++| `behaviors/` | `FollowBehind` (rc visual servo + orbit), `FollowAvoid` (its obstacle brake / sidestep: furniture map + looming), `Scan`, `Explore` (scan-score-hop), `Approach`, `ReacquirePerson` | `follow.*`, `follow.avoid.*` (`enabled: false` = off), `explore.*`, `approach.*` |
+ | `mission/` | State machine, query inboxes, **guidance** (target vs the person: distance, turn, clock face) | |
+ | `drone/` | `TelloDrone` (non-blocking commands, dry-run), `SafetyGovernor` (clamps, ceiling/floor, battery, stale video -> hover) | `safety.*` |
+ | `sim/` | Renderer, Tello-like kinematics, walking person, oracle detectors, `SimRunner` | |
+diff --git a/reachglass/app.py b/reachglass/app.py
+index fbb6fc9..4247423 100644
+--- a/reachglass/app.py
++++ b/reachglass/app.py
+@@ -101,7 +101,15 @@ def run_sim(args, cfg) -> int:
+ 
+     items = [(args.at, q) for q in args.query]
+     inbox = MultiInbox(ScriptedInbox(items), StdinInbox() if not args.headless and sys.stdin.isatty() else None)
+-    r = SimRunner(cfg, inbox=inbox, seed=args.seed, announce=say)
++    world = xy = heading = None
++    if args.scenario != "demo":  # follow-with-obstacles rooms (sim/follow_scenarios.py)
++        from .sim.follow_scenarios import SCENARIOS
++
++        if args.scenario not in SCENARIOS:
++            print(f"unknown --scenario {args.scenario!r} (have: demo, {', '.join(SCENARIOS)})")
++            return 2
++        world, xy, heading = SCENARIOS[args.scenario]()
++    r = SimRunner(cfg, world=world, drone_xy=xy, drone_heading=heading, inbox=inbox, seed=args.seed, announce=say)
+     win = Window(args.headless, args.record, "ReachGlass (simulator)")
+     log = RunLog(args.log)
+     from .dashboard import render
+@@ -225,6 +233,8 @@ def main(argv=None) -> int:
+     p.add_argument("--seconds", type=float, default=240.0, help="sim: stop after this much simulated time")
+     p.add_argument("--realtime", action="store_true", help="sim: run at wall-clock speed")
+     p.add_argument("--seed", type=int, default=0)
++    p.add_argument("--scenario", default="demo",
++                   help="sim room: demo | table_pass | doorway | box_in_path | floor_lamp | bystander")
+     p.add_argument("--udp", type=int, default=5005, help="UDP port for queries (0 = off)")
+     p.add_argument("--hz", type=float, default=20.0, help="tello: control loop rate")
+     p.add_argument("--quit-on-land", action="store_true")
+diff --git a/reachglass/behaviors/__init__.py b/reachglass/behaviors/__init__.py
+index 81b03f5..6b30e60 100644
+--- a/reachglass/behaviors/__init__.py
++++ b/reachglass/behaviors/__init__.py
+@@ -4,8 +4,9 @@ from .approach import Approach
+ from .base import FAILURE, RUNNING, SUCCESS, Behavior, Ctx, Discrete
+ from .explore import Explore, Hop, Scan, choose_hop, observe
+ from .follow import FollowBehind
++from .follow_avoid import FollowAvoid
+ from .loop import sense
+ from .reacquire import ReacquirePerson
+ 
+-__all__ = ["Behavior", "Ctx", "Discrete", "RUNNING", "SUCCESS", "FAILURE", "FollowBehind", "Scan", "Hop", "Explore",
++__all__ = ["Behavior", "Ctx", "Discrete", "RUNNING", "SUCCESS", "FAILURE", "FollowBehind", "FollowAvoid", "Scan", "Hop", "Explore",
+            "choose_hop", "observe", "Approach", "ReacquirePerson", "sense"]
+diff --git a/reachglass/behaviors/follow_avoid.py b/reachglass/behaviors/follow_avoid.py
+new file mode 100644
+index 0000000..55f4815
+--- /dev/null
++++ b/reachglass/behaviors/follow_avoid.py
+@@ -0,0 +1,658 @@
++"""Follow-behind with obstacle avoidance (follow.avoid): FollowBehind decides, this only limits forward / lateral.
++
++Every step FollowBehind computes its rc exactly as before (yaw toward the person, forward for the distance,
++altitude, orbit, lost-person search). Its command is caught (RcTap) and sent after these checks:
++  map        furniture from the context detector (every 5th frame in follow) goes into memory + grid like the
++             search does (explore.observe, at most every map_every_s) and into a short list of recent
++             obstacles. While following, the pose is dead-reckoned from the rc actually sent
++             (Odometry.on_velocity), so what was seen stays put on the map
++  corridor   an obstacle reaching flight height (top + 0.2 m > altitude, the grid's rule) within corridor_m
++             ahead and half_width_m sideways, from the recent list or the grid -> BRAKE: forward capped at 0,
++             or backing away at reverse_rc when closer than reverse_m. Other people count (1 m keep-out);
++             the person we follow does not
++  looming    perception.looming (the person's box excluded): flying at v, a surface closer than v x TTC <
++             stop_range_m, or TTC < ttc_brake_s at any speed -> BRAKE for hold_s, and the patch is kept as
++             an obstacle ahead for memory_s (so a stopped drone does not creep back into it)
++  sidestep   blocked for > sidestep_after_s while it wants to go forward, or while the person is hidden behind
++             the obstacle: slide sidestep_m sideways with rc, toward the side where the person was (that side
++             reopens the view), if the grid shows room (as approach.py's sidestep: >= 0.5 m) and the whole
++             slide keeps person_clearance_m from every person
++  behind     no rear camera: never back into something mapped behind; hovering with something mapped right
++             beside us: drift away from it slowly
++  recover    the person vanished while (or within recover_window_s after) we braked / sidestepped: the obstacle
++             most likely hides them. For up to recover_max_s the yaw holds on where they were last seen (moved
++             on along their last walking direction, at most 1 m) and the drone creeps there at recover_rc (the
++             brake and sidestep above still apply, so it goes round the obstacle's free side), stopping
++             person_clearance_m short of that spot. It only creeps where looming can see (not turning hard,
++             enough texture ahead: a blank wall stops it) and at most recover_max_m in all. Meanwhile the mission does not switch to REACQUIRE
++             (reacquire_wait; its "lost" rule fires ~4.5 s after a loss once the person lock lets go). Seen
++             again -> normal following.
++             Not when they vanished close (walking under us): FollowBehind backs off then
++Yaw and altitude always stay FollowBehind's: the fly (or the PID) keeps steering at the person.
++enabled: false = FollowBehind exactly (kill switch).
++"""
++
++from __future__ import annotations
++
++import logging
++import math
++from collections import deque
++from dataclasses import dataclass
++
++import numpy as np
++
++from ..config import FollowCfg
++from .base import Ctx, clamp, deadband
++from ..types import LoomingObs
++from .explore import FOOTPRINT, observe
++from .follow import FollowBehind
++
++log = logging.getLogger("reachglass.behaviors")
++TOP_CLEARANCE_M = 0.2  # like Grid.blocks: furniture whose top is within this of flight height is an obstacle
++UNDER_CLEARANCE_M = 0.25  # something overhead is passable when its bottom is this far above the drone's height
++
++
++@dataclass
++class Obstacle:
++    t: float  # last seen
++    x: float  # mission frame (dead-reckoned while following)
++    y: float
++    radius: float
++    top: float  # highest point above the floor (inf = unknown / reaches any height)
++    src: str  # class name, "person", "looming" or "overhead"
++    bottom: float = 0.0  # lowest point above the floor (> 0: something overhead, e.g. a door header)
++    clear: float = 0.0  # keep the drone's centre this far away (0 = radius + follow.avoid.half_width_m)
++
++
++class RcTap:
++    """Stands in for ctx.drone while FollowBehind.step runs: records its rc instead of sending it."""
++
++    def __init__(self, inner):
++        self.inner = inner
++        self.cmd: tuple[int, int, int, int] | None = None
++
++    def rc(self, lr: int, fb: int, ud: int, yaw: int) -> None:
++        self.cmd = (int(lr), int(fb), int(ud), int(yaw))
++
++    def __getattr__(self, name):
++        return getattr(self.inner, name)
++
++
++class FollowAvoid(FollowBehind):
++    name = "follow"
++
++    def __init__(self, cfg: FollowCfg):
++        super().__init__(cfg)
++        self.a = cfg.avoid
++        self._reset(0.0)
++
++    def _reset(self, now: float) -> None:
++        self.obstacles: list[Obstacle] = []
++        self.blocked_since: float | None = None
++        self.clear_since: float | None = now
++        self.brake_until = -math.inf
++        self.side = 0  # sidestep in progress: -1 left, +1 right
++        self.side_from = (0.0, 0.0)
++        self.side_t0 = 0.0
++        self.sidesteps = 0
++        self.v = [0.0, 0.0]  # dead-reckoned body speed (forward, right), m/s
++        self.v_hist: deque = deque(maxlen=60)  # (t, forward m/s)
++        self.last_dr_t: float | None = None
++        self.last_map_t = -math.inf
++        self.sent = (0, 0, 0, 0)
++        self.loom = None  # latest LoomingObs
++        self.person_xy: tuple[float, float] | None = None  # where the followed person was last seen
++        self.person_xy_t = -math.inf
++        self.person_track: deque = deque(maxlen=40)  # (t, x, y) of the followed person, mission frame
++        self.bystanders: list[tuple[float, float, float]] = []  # (t, x, y) where other people stood
++        self.why = ""  # current avoidance reason (status / log)
++        self.events: list[tuple[float, str]] = []  # (t, what) for tests and the run log
++        self.blocked_by: Obstacle | None = None
++        self.braking = False
++        self.loom_why = "looming"
++        self.loom_streak = 0
++        self.duck: dict | None = None  # ducking under something overhead: {"alt", "t0", "bottom", "under"}
++        self.round_phase, self.round_obs, self.round_line, self.back_t0 = "", None, (0.0, 0.0, 0.0), 0.0
++        self.recover_why = ""
++        self.recover_from = (0.0, 0.0)
++        self.recover_path_m = 0.0
++        self.loom_hit_t = -1.0
++        self.yaw_hist: deque = deque(maxlen=40)  # (t, yaw rc sent)
++        self.avoid_active_t = -math.inf  # last time we braked or sidestepped
++        self.recover_t0: float | None = None  # occlusion recovery running since
++        self.recover_done = False  # one recovery per loss
++        self.reacquire_wait = False  # read by Mission: an obstacle hides the person and we are going round it
++
++    def start(self, ctx: Ctx) -> None:
++        super().start(ctx)
++        self._reset(ctx.now)
++        ctx.perception.not_the_person.clear()
++
++    # ------------------------------------------------------------------ main
++    def step(self, ctx: Ctx) -> str:
++        if not self.a.enabled:
++            return super().step(ctx)
++        self._dead_reckon(ctx)
++        self._not_the_user(ctx)
++        self._map(ctx)
++        tap = RcTap(ctx.drone)
++        ctx.drone = tap
++        try:
++            r = super().step(ctx)
++        finally:
++            ctx.drone = tap.inner
++        if tap.cmd is None:
++            return r
++        lr, fb, ud, yaw = tap.cmd
++        rec = self._recover(ctx) if self.a.recover else None
++        if rec is not None:
++            lr, fb, yaw = rec  # ud stays FollowBehind's altitude hold
++        lr, fb, ud, yaw = self._avoid(ctx, lr, fb, ud, yaw)
++        ctx.drone.rc(lr, fb, ud, yaw)  # yaw and ud as FollowBehind decided (recovering: yaw on the remembered spot)
++        self.sent = (lr, fb, ud, yaw)
++        self.yaw_hist.append((ctx.now, yaw))
++        # FollowBehind's approach-rate feed-forward subtracts our own speed: it must see what was really sent
++        if self.fwd_hist and self.fwd_hist[-1][0] == ctx.now:
++            self.fwd_hist[-1] = (ctx.now, fb)
++        if rec is not None:  # FollowBehind's "person lost: turning" is not what happens now
++            self.status = self.recover_why + (f" | {self.why}" if self.why else "")
++        elif self.why:
++            self.status = f"{self.status} | {self.why}"
++        return r
++
++    # ------------------------------------------------------------------ sensing
++    def _not_the_user(self, ctx: Ctx) -> None:
++        """Never follow a bystander: a person where a bystander stood (last 30 s), far from where the user should
++        be, is ruled out for the person lock; if the lock is on them now, FollowBehind does not see them."""
++        res, now = ctx.res, ctx.now
++        if not ctx.new_frame or res is None:
++            return
++        pose = ctx.odom.pose
++        self.bystanders = [b for b in self.bystanders if now - b[0] <= 30.0]
++        if res.person is not None and res.person.range_m is not None:
++            for p in res.persons:  # remember where the others stand while we are sure who the user is
++                if p.range_m is not None and p.det.track_id != res.person.det.track_id:
++                    self.bystanders.append((now, *pose.point_at(p.range_m, p.bearing_deg)))
++            self.bystanders = self.bystanders[-60:]
++        if self.person_xy is None or not self.bystanders:
++            return
++        ux, uy = self._where_they_went() if now - self.person_xy_t > 0.5 else self.person_xy
++        for p in res.persons:
++            if p.range_m is None:
++                continue
++            x, y = pose.point_at(p.range_m, p.bearing_deg)
++            at_bystander = any(math.hypot(x - bx, y - by) < 0.7 for _, bx, by in self.bystanders)
++            if at_bystander and math.hypot(x - ux, y - uy) > 1.2:
++                if p.det.track_id not in ctx.perception.not_the_person:
++                    self._event(ctx, f"person at {p.range_m:.1f} m is the bystander, not the user: not following them")
++                ctx.perception.not_the_person.add(p.det.track_id)
++                if res.person is not None and res.person.det.track_id == p.det.track_id:
++                    res.person = None  # FollowBehind must not steer at them
++
++    def _dead_reckon(self, ctx: Ctx) -> None:
++        """Advance the pose with the rc we sent, through the stick's first-order lag (like the sim / latency test)."""
++        now = ctx.now
++        dt = 0.0 if self.last_dr_t is None else now - self.last_dr_t
++        self.last_dr_t = now
++        if dt <= 0 or dt > 0.5:
++            return
++        k = 1.0 - math.exp(-dt / self.a.rc_tau_s)
++        lr, fb = self.sent[0], self.sent[1]
++        self.v[0] += (fb / 100.0 * self.a.rc_mps - self.v[0]) * k
++        self.v[1] += (lr / 100.0 * self.a.rc_mps - self.v[1]) * k
++        ctx.odom.on_velocity(self.v[0], self.v[1], dt)
++        self.v_hist.append((now, self.v[0]))
++
++    def _speed_at(self, t: float) -> float:
++        """Our forward speed (m/s) at time t (the moment a frame was captured), from the dead reckoning."""
++        best = 0.0
++        for ts, v in self.v_hist:
++            if ts <= t:
++                best = v
++        return best
++
++    def _map(self, ctx: Ctx) -> None:
++        res = ctx.res
++        if not ctx.new_frame or res is None:
++            return
++        now, pose, alt = ctx.now, ctx.odom.pose, ctx.altitude
++        self.obstacles = [o for o in self.obstacles if now - o.t <= self.a.memory_s]
++        if res.person is not None and res.person.range_m is not None and self.duck is None:
++            # (ducked below their head height the range cues do not hold: keep the last good position)
++            self.person_xy, self.person_xy_t = pose.point_at(res.person.range_m, res.person.bearing_deg), now
++            self.person_track.append((now, *self.person_xy))
++        for p in res.persons:  # OTHER people (only with the person locked): 1 m keep-out, whatever their height
++            if res.person is not None and p.range_m is not None and p.det.track_id != res.person.det.track_id:
++                keep = max(self.a.person_clearance_m, 0.3 + self.a.half_width_m)  # never closer than 1 m
++                self.obstacles.append(Obstacle(now, *pose.point_at(p.range_m, p.bearing_deg), 0.3, math.inf, "person",
++                                               clear=keep + 0.1))  # + range noise
++        if res.looming is not None:
++            self.loom = res.looming
++        if not (res.ran.get("context") or res.ran.get("target")):
++            return
++        cam = ctx.perception.camera.for_frame(*res.image_size)
++        heights = ctx.cfg.perception.object_heights_m
++        for o in res.context:
++            rng, top = o.range_m, math.inf
++            if rng is None and alt is not None and o.cls in heights and o.det.bbox[1] > 3:
++                # close to a tall object only its top is in frame (the camera cannot tilt): range from the
++                # elevation of its top edge and its class height, like the person's head-elevation cue
++                rng = cam.range_to_height(o.det.cx, o.det.bbox[1], alt - heights[o.cls])
++                top = heights[o.cls]
++            if rng is None:
++                continue
++            if top == math.inf and alt is not None and o.det.bbox[1] > 3:
++                el = cam.elevation_deg(o.det.bbox[1], 0.0, o.det.cx)  # same as explore.observe
++                top = max(0.0, alt + rng * math.tan(math.radians(el)))
++            x, y = pose.point_at(rng, o.bearing_deg)
++            self.obstacles.append(Obstacle(now, x, y, FOOTPRINT.get(o.cls, 0.3), top, o.cls))
++        if now - self.last_map_t >= self.a.map_every_s:
++            self.last_map_t = now
++            observe(ctx, mark_view=False)  # memory + grid, exactly as the search / approach do
++
++    # ------------------------------------------------------------------ geometry
++    def _reaches_us(self, o: Obstacle, alt: float | None) -> bool:
++        """At our height: its top within TOP_CLEARANCE_M below us, and its bottom not far enough above us."""
++        return alt is None or (o.top + TOP_CLEARANCE_M > alt and o.bottom < alt + UNDER_CLEARANCE_M)
++
++    def _need(self, o: Obstacle) -> float:
++        return o.clear or (o.radius + self.a.half_width_m)
++
++    def _body(self, ctx: Ctx, x: float, y: float) -> tuple[float, float]:
++        """World point -> (ahead, right) of the drone, metres."""
++        pose = ctx.odom.pose
++        h = math.radians(pose.heading_deg)
++        dx, dy = x - pose.x, y - pose.y
++        return dx * math.cos(h) + dy * math.sin(h), -dx * math.sin(h) + dy * math.cos(h)
++
++    def _ahead(self, ctx: Ctx) -> tuple[float | None, Obstacle | None]:
++        """Distance to the nearest obstacle in the forward corridor (None = clear), and which one (None = grid)."""
++        a, alt = self.a, ctx.altitude
++        best, which = None, None
++        for o in self.obstacles:
++            if not self._reaches_us(o, alt):
++                continue  # the drone flies over it (a chair at 2 m altitude)
++            ahead, right = self._body(ctx, o.x, o.y)
++            need = self._need(o)
++            if ahead > 0 and abs(right) < need:
++                # how far until the drone's centre enters its keep-out disc (radius + corridor half width, or 1 m)
++                d = max(0.0, ahead - math.sqrt(max(need ** 2 - right ** 2, 0.0)) + a.half_width_m * (not o.clear))
++                if d < a.corridor_m and (best is None or d < best):
++                    best, which = d, o
++        if a.use_map:
++            pose = ctx.odom.pose
++            for off in (-a.half_width_m, 0.0, a.half_width_m):
++                start = pose.moved(right_m=off)
++                d = ctx.grid.clear_distance(start, pose.heading_deg, a.corridor_m, unknown_ok_m=a.corridor_m,
++                                            margin_m=0.0, altitude_m=alt)
++                if d < a.corridor_m - 1e-6 and (best is None or d < best):
++                    best, which = d, None
++        return best, which
++
++    def _room(self, ctx: Ctx, heading_off: float, dist_m: float) -> float:
++        """Free distance from the drone along heading + heading_off (grid and recent obstacles)."""
++        pose, alt = ctx.odom.pose, ctx.altitude
++        room = ctx.grid.clear_distance(pose, pose.heading_deg + heading_off, dist_m, unknown_ok_m=dist_m,
++                                       margin_m=0.0, altitude_m=alt)
++        h = math.radians(heading_off)
++        ux, uy = math.cos(h), math.sin(h)  # direction in the body frame (ahead, right)
++        for o in self.obstacles:
++            if not self._reaches_us(o, alt):
++                continue
++            ahead, right = self._body(ctx, o.x, o.y)
++            along = ahead * ux + right * uy
++            if along > 0 and abs(-ahead * uy + right * ux) < o.radius + 0.15:
++                room = min(room, max(0.0, along - o.radius))
++        return room
++
++    def _people(self, ctx: Ctx) -> list[tuple[float, float]]:
++        pts = []
++        pose = ctx.odom.pose
++        if ctx.res is not None:
++            pts += [pose.point_at(p.range_m, p.bearing_deg) for p in ctx.res.persons if p.range_m is not None]
++        if self.person_xy is not None and ctx.now - self.person_xy_t <= 3.0:
++            pts.append(self.person_xy)
++        return pts
++
++    def _slide_keeps_clear(self, ctx: Ctx, side: int) -> bool:
++        """The whole sideways slide keeps person_clearance_m from every person (or at least does not get closer)."""
++        pose = ctx.odom.pose
++        end = pose.moved(right_m=side * self.a.sidestep_m)
++        for px, py in self._people(ctx):
++            now_d = pose.distance_to(px, py)
++            worst = min(math.hypot(pose.x + k / 10 * (end.x - pose.x) - px, pose.y + k / 10 * (end.y - pose.y) - py)
++                        for k in range(11))
++            if worst < min(self.a.person_clearance_m, now_d - 0.05):
++                return False
++        return True
++
++    def _choose_side(self, ctx: Ctx, obstacle: Obstacle | None) -> int:
++        """Toward where the person was (that reopens the view), else away from the obstacle; needs room like
++        approach.py's sidestep (>= 0.5 m free within 0.8 m) and the person keep-out."""
++        o_right = 0.0 if obstacle is None else self._body(ctx, obstacle.x, obstacle.y)[1]
++        if obstacle is None and self.loom is not None and self.loom.ttc_s is not None:
++            o_right = self.loom.x_frac - 0.5  # looming patch left or right of centre
++        prefer = -1 if o_right > 0 else 1
++        if self.person_xy is not None and ctx.now - self.person_xy_t <= 10.0:
++            p_right = self._body(ctx, *self.person_xy)[1]
++            prefer = 1 if p_right > o_right else -1
++        for side in (prefer, -prefer):
++            if self._room(ctx, 90 * side, 0.8) >= 0.5 and self._slide_keeps_clear(ctx, side):
++                return side
++        return 0
++
++    # ------------------------------------------------------------------ decision
++    def _event(self, ctx: Ctx, what: str) -> None:
++        self.events.append((ctx.now, what))
++        ctx.note(f"follow avoid: {what}")
++
++    def _looming_brake(self, ctx: Ctx) -> str | None:
++        a, L = self.a, self.loom
++        if not a.looming or L is None or ctx.now - L.t > 0.5:
++            return None
++        if any(abs(y) > a.max_yaw_rc for t, y in self.yaw_hist if ctx.now - t <= 0.6):
++            return None  # turning hard: what is left of the rotation after derotation reads as looming
++        if L.t == self.loom_hit_t:
++            return None  # this frame was already judged (the brake holds for hold_s)
++        self.loom_hit_t = L.t
++        if L.texture < a.min_texture:
++            return None
++        if self.duck is not None:
++            # ducked under what the user just walked under: the header is above, the door posts to the sides, and
++            # a door frame is all edges at close range (looms everywhere). Seen obstacles still brake.
++            return None
++        if L.ttc_s is None:
++            return None
++        v = self._speed_at(L.t - L.dt_s / 2)  # our speed while those two frames were taken
++        dist = v * L.ttc_s if v >= a.min_speed_mps else None
++        # hovering: only something coming at us fast; flying: close AND soon (the range from a slow speed is noise)
++        hit = (L.ttc_s < a.ttc_brake_s) if dist is None else (L.ttc_s < a.ttc_move_s and dist < a.stop_range_m)
++        self.loom_streak = self.loom_streak + 1 if hit else 0
++        if self.loom_streak >= 2:  # two frames in a row: one noisy frame does not stop the drone
++            # remember it as an obstacle ahead, where the looming patch is
++            cam = ctx.perception.camera.for_frame(*ctx.res.image_size) if ctx.res is not None else ctx.perception.camera
++            bearing = cam.bearing_deg(L.x_frac * cam.width)
++            r = min(max(dist if dist is not None else 0.7 * a.stop_range_m, 0.3), a.corridor_m)
++            x, y = ctx.odom.pose.point_at(r + 0.3, bearing)
++            self.obstacles.append(Obstacle(ctx.now, x, y, 0.3, math.inf, "looming"))
++            return f"looming TTC {L.ttc_s:.1f} s" + (f" (~{dist:.1f} m)" if dist is not None else "")
++        return None
++
++    # ------------------------------------------------------------------ occlusion recovery
++    def _recover(self, ctx: Ctx) -> tuple[int, int, int] | None:
++        """(lateral, forward, yaw) while creeping toward where the hidden person was last seen, else None."""
++        a, now, c = self.a, ctx.now, self.c
++        unseen = math.inf if self.last_seen_t is None else now - self.last_seen_t
++        if unseen < 0.5 or self.person_xy is None:
++            if unseen < 0.5 and self.recover_t0 is not None:
++                self._event(ctx, f"recover: person seen again after {now - self.recover_t0:.1f} s")
++            if unseen < 0.5:
++                self.recover_t0, self.recover_done = None, False
++            self.reacquire_wait = False
++            return None
++        if self.recover_t0 is None:
++            # start only if an obstacle explains the loss: we were braking / sidestepping when they vanished
++            explained = self.avoid_active_t >= self.last_seen_t - a.recover_window_s
++            if self.recover_done or not explained or self.last_close or now - self.person_xy_t > 1.5:
++                self.reacquire_wait = False
++                return None
++            self.recover_t0 = now
++            self.recover_from = (ctx.odom.pose.x, ctx.odom.pose.y)
++            self.recover_path_m = 0.0
++            self._event(ctx, "recover: person hidden behind the obstacle, creeping toward where they were")
++        spent = now - self.recover_t0
++        if spent > a.recover_max_s:
++            if not self.recover_done:
++                self._event(ctx, f"recover: gave up after {a.recover_max_s:.0f} s")
++            self.recover_done, self.recover_t0, self.reacquire_wait = True, None, False
++            return None
++        self.reacquire_wait = True
++        pose = ctx.odom.pose
++        tx, ty = self._where_they_went()
++        bearing = pose.bearing_to(tx, ty)
++        yaw = clamp(deadband(bearing, c.yaw_deadband_deg) * c.yaw_gain, c.max_rc_yaw)
++        fly = getattr(self, "fly", None)  # fruit fly steering (follow.steering: fly), if present: it steers
++        if fly is not None:
++            try:
++                yaw = clamp(fly.yaw(now, bearing, None, now, fallback=yaw), c.max_rc_yaw)
++            except Exception:  # noqa: BLE001 - any fly problem: keep the PID yaw on the remembered bearing
++                pass
++        self.recover_path_m += pose.distance_to(*self.recover_from)
++        self.recover_from = (pose.x, pose.y)
++        left = pose.distance_to(tx, ty) - a.person_clearance_m  # stop this short of their last spot
++        # creep only where looming can see: turn first (a hard turn switches looming off), no blank wall ahead
++        turning = any(abs(y) > a.max_yaw_rc for t, y in self.yaw_hist if now - t <= 0.6) or abs(yaw) > a.max_yaw_rc
++        L = self.loom
++        blind = a.looming and (L is None or now - L.t > 0.5 or L.texture < a.min_texture)
++        fwd = a.recover_rc if (left > 0.1 and abs(bearing) < 15.0 and not turning and not blind
++                               and self.recover_path_m < a.recover_max_m) else 0
++        if fwd:
++            self.recover_why = f"person hidden: creeping to where they were ({left:.1f} m, {spent:.0f}/{a.recover_max_s:.0f} s)"
++        else:
++            why = ("turning to" if turning else "cannot see ahead, facing" if blind else "facing")
++            self.recover_why = f"person hidden: {why} where they were ({spent:.0f} s)"
++        return 0, int(fwd), int(yaw)
++
++    def _where_they_went(self) -> tuple[float, float]:
++        """Last-seen position moved on along their walking direction of the last second before (<= 1 m)."""
++        x, y = self.person_xy
++        h = [p for p in self.person_track if self.person_xy_t - p[0] <= 1.0]
++        if len(h) < 5 or h[-1][0] - h[0][0] < 0.5:
++            return x, y
++        vx, vy = (h[-1][1] - h[0][1]) / (h[-1][0] - h[0][0]), (h[-1][2] - h[0][2]) / (h[-1][0] - h[0][0])
++        d = math.hypot(vx, vy)
++        if d < 0.1:  # standing (or range noise)
++            return x, y
++        k = min(1.0, d * 3.0) / d  # where they get to in ~3 s at that pace, at most 1 m further
++        return x + vx * k, y + vy * k
++
++    # ------------------------------------------------------------------ going round
++    def _round_delay(self, which: Obstacle | None) -> float:
++        """Something seen (a detection, a person): go round right away. Only looming / the map (extent unknown):
++        wait sidestep_after_s first, it may be a wall."""
++        return self.a.detour_after_s if (which is not None and which.src != "looming") else self.a.sidestep_after_s
++
++    def _refresh(self, o: Obstacle) -> Obstacle:
++        """The newest sighting of the same obstacle (within 0.6 m): people move, detections jitter."""
++        same = [q for q in self.obstacles if q.src == o.src and math.hypot(q.x - o.x, q.y - o.y) < 0.6]
++        return max(same, key=lambda q: q.t) if same else o
++
++    def _go_round(self, ctx: Ctx, lr: int, fb: int, blocked: bool, why: str) -> tuple[int, int, str]:
++        """slide: sideways until our corridor is clear of it (at most detour_max_m; unknown extent: sidestep_m);
++        pass: on past it, keeping its keep-out; back: drift back toward the line we were on (<= 3 s)."""
++        a, now, pose, side = self.a, ctx.now, ctx.odom.pose, self.side
++        name = "right" if side > 0 else "left"
++        o = self.round_obs = self._refresh(self.round_obs) if self.round_obs is not None else None
++        moved = pose.distance_to(*self.side_from)
++        if self.round_phase == "slide":
++            clear_of_it = o is not None and abs(self._body(ctx, o.x, o.y)[1]) >= self._need(o) + 0.1
++            done = clear_of_it or (o is None and moved >= a.sidestep_m)
++            x0, y0, h0 = self.round_line
++            off = abs(-(pose.x - x0) * math.sin(math.radians(h0)) + (pose.y - y0) * math.cos(math.radians(h0)))
++            stop = (moved >= a.detour_max_m or off >= a.detour_max_m  # walls are not mapped: never wander off far
++                    or now - self.side_t0 > a.detour_max_m / max(0.05, a.sidestep_rc / 100 * a.rc_mps) + 2
++                    or not self._slide_keeps_clear(ctx, side) or self._room(ctx, 90 * side, 0.4) < 0.3)
++            if done and o is not None:
++                self.round_phase = "pass"
++                self._event(ctx, f"sidestep done ({moved:.2f} m): passing the {o.src}")
++            elif done or stop:
++                self._event(ctx, f"sidestep done ({moved:.2f} m)" + ("" if done else ": no more room"))
++                self.side = 0
++                self.blocked_since = now if blocked else None  # another one only after the delay again
++                return lr, fb, why
++            else:
++                return side * a.sidestep_rc, min(fb, 0), f"going round {name} ({moved:.1f} m)"
++        if self.round_phase == "pass":
++            ahead, right = self._body(ctx, o.x, o.y)
++            if ahead < -(o.radius + 0.2) or now - self.side_t0 > 15.0:
++                self.round_phase, self.back_t0 = "back", now
++            else:
++                person = o.src == "person"
++                keep = side * (a.sidestep_rc if person else 15) if abs(right) < self._need(o) + (0.2 if person else 0.05) else 0
++                return keep, min(fb, 20) if person else fb, f"passing the {o.src} on its {'left' if side > 0 else 'right'}"
++        # back: drift toward the line we were following on before going round
++        x0, y0, h0 = self.round_line
++        h = math.radians(h0)
++        off = -(pose.x - x0) * math.sin(h) + (pose.y - y0) * math.cos(h)  # + = right of that line
++        if off * side < 0.15 or now - self.back_t0 > 3.0 or blocked or self._room(ctx, -90 * side, 0.5) < 0.4:
++            self._event(ctx, "went round: following")
++            self.side = 0
++            return lr, fb, why
++        return -side * 10, fb, "went round: drifting back to the follow line"
++
++    # ------------------------------------------------------------------ ducking under
++    def _user_went_through(self, ctx: Ctx, o: Obstacle | None) -> bool:
++        """The followed person walked (in the last 15 s) right through where we are blocked: whatever blocks us
++        leaves person height free below it."""
++        if o is None:
++            return False
++        return any(math.hypot(x - o.x, y - o.y) < 0.3 for t, x, y in self.person_track if ctx.now - t <= 15.0)
++
++    def _seen_nearby(self, ctx: Ctx) -> bool:
++        """Something detected (not a looming patch) stands within 2.5 m ahead, 1.2 m either side: no ducking there."""
++        for o in self.obstacles:
++            if o.src in ("looming", "overhead"):
++                continue
++            ahead, right = self._body(ctx, o.x, o.y)
++            if -0.3 < ahead < 2.5 and abs(right) < 1.2:
++                return True
++        return False
++
++    def _gap_below(self) -> bool:
++        """The looming row profile of an overhead thing: straight ahead (centre columns) it looms at / above the
++        horizon (>= 0.3/s) while the cells below the horizon are measurable and quiet (< 0.15/s: seeing far,
++        through the opening). Unmeasurable below = unknown = no."""
++        L = self.loom
++        if L is None or L.cells is None:
++            return False
++        rows, cols = L.cells.shape
++        c = slice(cols // 2 - 1, cols // 2 + 1)
++        up, below = L.cells[:rows - 1, c], L.cells[rows - 1, c]
++        return bool(np.isfinite(below).all() and np.nanmax(below) < 0.15
++                    and np.isfinite(up).any() and np.nanmax(up) >= 0.3)
++
++    def _duck(self, ctx: Ctx, ud: int, fb: int, blocked: bool, which: Obstacle | None) -> tuple[int, int, str]:
++        """Blocked only by something the looming saw, which the user just walked under, with no looming straight
++        ahead below the horizon: it is overhead (a door header). Descend duck_below_m under it (not below
++        duck_floor_m), go on under it, climb back to follow.altitude_m once it is behind us."""
++        a, c, now, alt = self.a, self.c, ctx.now, ctx.altitude
++        if not a.duck or alt is None:
++            return ud, fb, ""
++        if self.duck is None:
++            if not (blocked and which is not None and which.src == "looming"
++                    and self._user_went_through(ctx, which) and self._gap_below() and not self._seen_nearby(ctx)):
++                return ud, fb, ""
++            bottom = alt - 0.05  # it blocked us at our height: its bottom is about there (the user passed below)
++            target = max(a.duck_floor_m, ctx.cfg.safety.min_altitude_m + 0.2, bottom - a.duck_below_m)
++            for o in self.obstacles:  # everything the looming put ahead of us is that overhead thing
++                if o.src == "looming" and abs(self._body(ctx, o.x, o.y)[1]) < 0.8:
++                    o.src, o.bottom = "overhead", bottom
++            self.duck = {"alt": target, "t0": now, "bottom": bottom, "under": False}
++            self._event(ctx, f"duck: overhead at ~{bottom:.2f} m (the user walked under it): down to {target:.2f} m")
++        d = self.duck
++        for o in self.obstacles:
++            if o.src == "overhead":
++                o.t = now  # remembered while ducking
++        near = [o for o in self.obstacles if o.src == "overhead"
++                and self._body(ctx, o.x, o.y)[0] > -0.6 and abs(self._body(ctx, o.x, o.y)[1]) < 0.8]
++        if d["under"] and (not near or now - d["t0"] > a.duck_max_s) and not any(
++                abs(self._body(ctx, o.x, o.y)[0]) < 0.6 for o in near):
++            self._event(ctx, f"duck: clear of it, climbing back to {c.altitude_m:.1f} m")
++            for o in self.obstacles:
++                if o.src == "overhead":
++                    o.t = -math.inf  # forget it
++            self.duck = None
++            return ud, fb, ""
++        ud = int(clamp(deadband(d["alt"] - alt, c.alt_deadband_m) * c.alt_gain, c.max_rc_up))
++        if alt > d["alt"] + 0.08 and not d["under"]:
++            return ud, min(fb, 0), f"ducking under an overhead obstacle (~{d['bottom']:.2f} m): down to {d['alt']:.2f} m"
++        d["under"] = True
++        # below head height FollowBehind's range cues fail (it would not move on): we go through ourselves, slowly,
++        # never within person_clearance_m + 0.2 of where the user was last measured
++        past = [self._body(ctx, o.x, o.y)[0] for o in self.obstacles if o.src == "overhead"]
++        # their size says how close they are (a person 1.2 m away fills most of the frame at this height)
++        p = ctx.res.person if ctx.res is not None else None
++        user_far = p is not None and p.det.h < 0.45 * ctx.res.image_size[1]
++        # FollowBehind's forward is ignored here: below head height its range cues say "too close" and it backs off
++        fb = a.recover_rc if (past and max(past) > -0.8 and user_far) else 0
++        return ud, fb, f"ducked to {d['alt']:.2f} m under an overhead obstacle"
++
++    def _avoid(self, ctx: Ctx, lr: int, fb: int, ud: int, yaw: int) -> tuple[int, int, int, int]:
++        a, now, pose = self.a, ctx.now, ctx.odom.pose
++        want_fwd = fb > 0
++        loom_why = self._looming_brake(ctx)
++        if loom_why is not None:
++            self.brake_until = now + a.hold_s
++            self.loom_why = loom_why
++        dist, which = self._ahead(ctx)
++        blocked = dist is not None or now < self.brake_until
++        why = ""
++        if dist is not None:
++            what = "mapped obstacle" if which is None else ("looming patch" if which.src == "looming" else which.src)
++            why = f"{what} {dist:.1f} m ahead: braking"
++        elif blocked:
++            why = f"{self.loom_why}: braking"
++        if blocked and not self.braking:
++            self._event(ctx, f"brake: {loom_why or why}")
++        self.braking = blocked
++        if blocked or self.side:
++            self.avoid_active_t = now
++        self.blocked_by = which
++        # the person vanished behind the obstacle (seen in the last 10 s): sidestepping may bring them back
++        unseen = math.inf if self.last_seen_t is None else now - self.last_seen_t
++        hidden = blocked and 0.5 < unseen < 10.0
++        if blocked and (want_fwd or hidden):
++            self.blocked_since = self.blocked_since or now
++            self.clear_since = None
++        elif not blocked:
++            if self.blocked_since is not None:
++                self._event(ctx, "clear")
++            self.blocked_since = None
++            self.clear_since = self.clear_since or now
++            if now - self.clear_since > 2.0:
++                self.sidesteps = 0
++        if blocked:
++            # back away only from something SEEN (a looming range is too rough to reverse blind on)
++            seen = dist is not None and (which is None or which.src != "looming")
++            cap = -a.reverse_rc if (seen and dist < a.reverse_m) else 0
++            fb = min(fb, cap)
++        # duck under something overhead (a door header) the user just walked under
++        ud, fb, duck_why = self._duck(ctx, ud, fb, blocked, which)
++        if duck_why:
++            why = duck_why
++            blocked = blocked and self.duck is None  # under it now: it no longer blocks us
++        # go round: rc sideways until the corridor is clear of it, pass it, drift back (yaw stays FollowBehind's)
++        if self.side:
++            lr, fb, why = self._go_round(ctx, lr, fb, blocked, why)
++        elif (a.sidestep and self.duck is None and self.blocked_since is not None
++              and now - self.blocked_since > self._round_delay(which) and self.sidesteps < a.max_sidesteps):
++            side = self._choose_side(ctx, which)
++            if side:
++                self.side, self.side_from, self.side_t0, self.round_phase = side, (pose.x, pose.y), now, "slide"
++                self.round_obs = which if (which is not None and which.src != "looming") else None
++                if self.sidesteps == 0:  # the line we were on when this blocked episode began
++                    self.round_line = (pose.x, pose.y, pose.heading_deg)
++                self.sidesteps += 1
++                what = self.round_obs.src if self.round_obs is not None else "obstacle"
++                self._event(ctx, f"sidestep {'right' if side > 0 else 'left'}: going round the {what}")
++                lr, fb = side * a.sidestep_rc, min(fb, 0)
++                why = f"going round the {what} ({'right' if side > 0 else 'left'})"
++            elif blocked:
++                why += " (no room to go round)"
++        # no rear camera: never back into something mapped behind us
++        if fb < 0 and self._room(ctx, 180, 0.8) < 0.8:
++            fb = 0
++            why = (why + "; " if why else "") + "obstacle behind: not backing off"
++        # hovering next to something mapped: drift away from it slowly
++        if not self.side and lr == 0 and abs(fb) < 5:
++            left, right = self._room(ctx, -90, 0.5), self._room(ctx, 90, 0.5)
++            if min(left, right) < 0.35:
++                lr = 10 if left < right else -10
++                why = (why + "; " if why else "") + f"keeping clear of the {'left' if left < right else 'right'}"
++        if (self.loom is not None and a.looming and self.loom.texture < a.min_texture and ctx.now - self.loom.t < 0.5
++                and not why):
++            why = "looming blind (no texture ahead)"
++        if why != self.why and why:
++            log.info("follow avoid: %s", why)
++        self.why = why
++        return int(lr), int(fb), ud, yaw
+diff --git a/reachglass/config.py b/reachglass/config.py
+index 165dcd8..00b103d 100644
+--- a/reachglass/config.py
++++ b/reachglass/config.py
+@@ -72,7 +72,9 @@ class PerceptionCfg:
+         # the whole bottle: set 0.24 when using YOLO
+         "bottle": 0.19, "cup": 0.10, "backpack": 0.45, "chair": 0.85, "dining table": 0.75, "couch": 0.85,
+         "bed": 0.60, "tv": 0.55, "laptop": 0.25, "refrigerator": 1.70, "potted plant": 0.60, "bench": 0.45,
+-        "sink": 0.20, "oven": 0.85, "microwave": 0.30, "toilet": 0.75, "suitcase": 0.60})
++        "sink": 0.20, "oven": 0.85, "microwave": 0.30, "toilet": 0.75, "suitcase": 0.60,
++        # follow.avoid: a torchiere floor lamp, whole (needs a YOLO-World "floor lamp" prompt: not a COCO class)
++        "floor lamp": 1.85})
+     # Widths (m) of ROUND objects (same width from every side). Used when the object's top or bottom is
+     # hidden (e.g. behind a chair): then its pixel height shrinks but its width does not. Measure yours.
+     object_widths_m: dict = field(default_factory=lambda: {"bottle": 0.09, "cup": 0.08})
+@@ -81,12 +83,20 @@ class PerceptionCfg:
+     shoulder_width_m: float = 0.40
+     body_width_m: float = 0.48  # bbox width of a person seen from behind
+     # which detectors run in which mode (1 = every frame, N = every Nth frame, 0 = never)
++    # follow: furniture (context) every 5th frame feeds the obstacle map for follow.avoid; the target detector
++    # every 3rd frame, only once a target class is set (after a search). CPU budget per frame (30 fps stream):
++    # person YOLO-pose every frame + context YOLO 1/5 (~+20 % of the person cost on average; every 5th frame
++    # runs both) + colour target 1/3 (~0.7 ms) + looming (~1.5 ms). Set them to 0 for the old follow budget.
+     stride: dict = field(default_factory=lambda: {
+-        "follow": {"person": 1, "target": 0, "context": 0},
++        "follow": {"person": 1, "target": 3, "context": 5, "looming": 1},
+         "search": {"person": 5, "target": 1, "context": 2},
+         "approach": {"person": 3, "target": 1, "context": 0},  # people: person guard (blue jeans) + safety
+         "idle": {"person": 0, "target": 0, "context": 0},
+     })
++    # expansion of the forward view (detect/looming.py): the fly's looming channel, used by follow.avoid.
++    # kind "null" = off. Runs in the modes whose stride has "looming" (follow only by default).
++    looming: ComponentSpec = field(default_factory=lambda: ComponentSpec("divergence", {
++        "width": 96, "height": 72, "roi": [0.15, 0.15, 0.85, 0.85], "grid": [3, 4], "baseline_s": 0.12}))
+     # telemetry pitch sign so that nose-up is positive; 0 = do not use pitch (until checked on the drone)
+     pitch_sign: int = 0
+     target_range_m: tuple = (0.2, 8.0)  # plausible distances for a single-frame target confirmation
+@@ -103,11 +113,60 @@ class TrackingCfg:
+     lost_after_s: float = 1.5  # locked target / person considered lost after this long unseen
+ 
+ 
++@dataclass
++class FollowAvoidCfg:
++    """Obstacles while following (behaviors/follow_avoid.py). Only forward / lateral are touched: yaw (the fly or
++    the PID), altitude and backing off from the person stay FollowBehind's. enabled: false = the old follow."""
++
++    enabled: bool = True  # KILL SWITCH: false -> exactly FollowBehind (no brake, no sidestep, no follow mapping)
++    looming: bool = True  # brake on looming (perception.looming); false = mapped/detected obstacles only
++    # also brake for obstacles in the grid. Off by default: the grid never forgets, and sightings placed with the
++    # dead-reckoned pose smear into ghosts that stop the drone; fresh detections (memory_s) are used either way
++    use_map: bool = False
++    corridor_m: float = 1.0  # an obstacle this close ahead, reaching flight height, in the corridor -> brake
++    half_width_m: float = 0.3  # corridor half width (drone + margin)
++    reverse_m: float = 0.45  # closer than this: back away (at reverse_rc) instead of just stopping
++    reverse_rc: int = 15
++    ttc_brake_s: float = 1.2  # hovering: looming time-to-contact below this -> brake (something coming at us)
++    ttc_move_s: float = 2.5  # flying forward: TTC below this AND (own speed x TTC) < stop_range_m -> brake
++    stop_range_m: float = 0.9
++    min_speed_mps: float = 0.08  # below this own speed we count as hovering
++    max_yaw_rc: int = 20  # looming is ignored while the yaw stick was above this in the last 0.6 s
++    hold_s: float = 1.0  # a looming brake holds this long (and marks the obstacle ahead for memory_s)
++    memory_s: float = 3.0  # detected / looming obstacles are remembered this long (dead-reckoned)
++    min_texture: float = 0.25  # fewer measurable forward cells than this: looming is blind (status says so)
++    sidestep: bool = True  # go round: slide sideways (rc) until clear, pass, drift back; never toward a person
++    detour_after_s: float = 0.3  # something seen (detection / person) blocks: go round after this long
++    sidestep_after_s: float = 1.5  # only looming / the map (extent unknown, may be a wall): after this long
++    sidestep_m: float = 0.6  # extent unknown: slide this far
++    detour_max_m: float = 1.5  # slide at most this far to clear something seen
++    sidestep_rc: int = 25
++    max_sidesteps: int = 2  # per blocked episode
++    # duck under something overhead (a door header at 2.03 m while following at 2.0 m): only when the looming saw it,
++    # the user just walked through there and nothing looms straight ahead below the horizon. follow.altitude_m's
++    # "wearer height + 0.2 m" rule is relaxed only while ducking; the user's head stays near the image centre.
++    duck: bool = False  # OPT-IN: see docs; a looming-only thin obstacle next to the user's path can look like a header
++    duck_below_m: float = 0.35  # fly this far below its (estimated) bottom
++    duck_floor_m: float = 1.2  # never lower than this while ducking
++    duck_max_s: float = 20.0  # climb back after this long at the latest (not while right under it)
++    person_clearance_m: float = 1.0  # a sidestep never ends within this of a person (approach uses the same)
++    rc_mps: float = 1.0  # speed at rc 100 (follow.py assumes the same): dead reckoning while following
++    rc_tau_s: float = 0.35  # stick -> speed response time (latency test)
++    map_every_s: float = 0.5  # put context detections into the map / memory at most this often
++    # occlusion recovery: the person vanished while we braked / sidestepped (or within recover_window_s after)
++    recover: bool = True  # creep toward where they were last seen, round the obstacle
++    recover_window_s: float = 2.0
++    recover_max_s: float = 15.0  # creep for at most this long; the mission waits that long before REACQUIRE
++    recover_rc: int = 20  # creep speed (~0.2 m/s); brake, sidestep and keep-outs still apply
++    recover_max_m: float = 1.5  # creep at most this far in all (walls are invisible to the map)
++
++
+ @dataclass
+ class FollowCfg:
+     # Geometry note (Tello camera is fixed, +-21 deg vertical view): at 2.0 m high and 1.0 m behind only the
+     # person's HEAD is in frame (shoulders are 29 deg below the camera), so facing / orbit-behind cannot work
+     # and detection relies on YOLO seeing a head from above. Shoulders come into view from ~1.6 m behind.
++    avoid: FollowAvoidCfg = field(default_factory=FollowAvoidCfg)  # obstacles while following (follow_avoid.py)
+     distance_m: float = 1.0  # horizontal distance behind the person
+     altitude_m: float = 2.0  # hover height above the floor: >= person height + 0.2 m (checked at load)
+     yaw_gain: float = 1.2  # rc yaw per degree of bearing error
+@@ -283,6 +342,9 @@ def _merge(obj: Any, over: dict, path: str) -> Any:
+ def validate(cfg: Config) -> Config:
+     """Cross-field rules that would otherwise fail silently in flight."""
+     p, f, s, t = cfg.perception, cfg.follow, cfg.safety, cfg.tracking
++    if f.avoid.enabled and f.avoid.looming and (p.looming.kind in ("", "null") or not p.stride.get("follow", {}).get("looming")):
++        raise ValueError("follow.avoid.looming needs perception.looming and perception.stride.follow.looming > 0 "
++                         "(or set follow.avoid.looming: false)")
+     if f.altitude_m < p.person_height_m + 0.2:
+         raise ValueError(f"follow.altitude_m ({f.altitude_m}) must be >= perception.person_height_m + 0.2 "
+                          f"({p.person_height_m + 0.2:.2f}): too close to head height, the person range estimate breaks")
+diff --git a/reachglass/dashboard.py b/reachglass/dashboard.py
+index f4fb4f4..a987434 100644
+--- a/reachglass/dashboard.py
++++ b/reachglass/dashboard.py
+@@ -56,6 +56,21 @@ def camera_panel(ctx) -> np.ndarray:
+             for x, y, c in p.det.keypoints:
+                 if c > 0.4:
+                     cv2.circle(img, (int(x * sx), int(y * sy)), 3, COLORS["person"], -1)
++    lm = res.looming
++    if lm is not None:  # follow.avoid's looming: measured region, cells that loom, time-to-contact
++        x0, y0, x1, y1 = (int(v * s) for v, s in zip(lm.roi, (CAM_W, CAM_H, CAM_W, CAM_H)))
++        warn = lm.ttc_s is not None and lm.ttc_s < 3.0
++        cv2.rectangle(img, (x0, y0), (x1, y1), COLORS["warn"] if warn else COLORS["dim"], 1)
++        if lm.cells is not None:
++            rows, cols = lm.cells.shape
++            for (i, j), v in np.ndenumerate(lm.cells):
++                if np.isfinite(v) and v > 0.3:
++                    a = (x0 + (x1 - x0) * j // cols, y0 + (y1 - y0) * i // rows)
++                    b = (x0 + (x1 - x0) * (j + 1) // cols, y0 + (y1 - y0) * (i + 1) // rows)
++                    cv2.rectangle(img, a, b, COLORS["warn"], 2 if v > 0.6 else 1)
++        s = f"loom TTC {lm.ttc_s:.1f}s" if lm.ttc_s is not None else "loom -"
++        _txt(img, s + ("" if lm.texture >= 0.25 else " (no texture)"), (x0 + 4, y1 - 6), 0.45,
++             COLORS["warn"] if warn else COLORS["dim"])
+     for t in res.targets:
+         locked = res.target is not None and t.det.track_id == res.target.det.track_id
+         color = COLORS["target"] if (locked and t.confirmed) else COLORS["cand"]
+diff --git a/reachglass/detect/__init__.py b/reachglass/detect/__init__.py
+index 8eeb4bb..5eb5778 100644
+--- a/reachglass/detect/__init__.py
++++ b/reachglass/detect/__init__.py
+@@ -3,6 +3,7 @@
+ from ..registry import Registry
+ from .base import Detector, NullDetector
+ from .color_blob import ColorBlobDetector
++from .looming import DivergenceLooming, LoomingEstimator, NullLooming
+ 
+ DETECTORS = Registry("detector")
+ DETECTORS.register("color_blob")(ColorBlobDetector)
+@@ -16,4 +17,10 @@ def _yolo(**params):
+     return UltralyticsDetector(**params)
+ 
+ 
+-__all__ = ["DETECTORS", "Detector", "NullDetector", "ColorBlobDetector"]
++# looming estimators (perception.looming): expansion of the forward view, see looming.py
++LOOMING = Registry("looming estimator")
++LOOMING.register("divergence")(DivergenceLooming)
++LOOMING.register("null")(NullLooming)
++
++__all__ = ["DETECTORS", "Detector", "NullDetector", "ColorBlobDetector", "LOOMING", "LoomingEstimator",
++           "DivergenceLooming", "NullLooming"]
+diff --git a/reachglass/detect/looming.py b/reachglass/detect/looming.py
+new file mode 100644
+index 0000000..067a278
+--- /dev/null
++++ b/reachglass/detect/looming.py
+@@ -0,0 +1,223 @@
++"""Looming: is something ahead getting closer? From the expansion of the forward view (no model, ~1-2 ms).
++
++    loom = LOOMING.build(cfg.perception.looming)                # ComponentSpec: divergence | null
++    obs = loom.update(frame.image, frame.t, exclude=[person_box])   # LoomingObs (types.py)
++
++This is the fruit fly's looming channel (LPLC2 / LC4 in the FlyDrones retina, which it is adapted from:
++third_party/FlyDrones/src/flydrones/senses/retina.py, MIT licence, (c) 2026 SpikeCalls and FlyDrones
++contributors), redone for a single forward Tello camera:
++  1. grey, downsampled to ~96 x 72, blurred
++  2. compared with the frame ~baseline_s earlier. The drone's own ROTATION is removed first: the global
++     image shift (coarse-to-fine Lucas-Kanade; mostly yaw/pitch) is undone, so turning toward the person
++     does not look like looming (fast turns still can: follow_avoid.py ignores looming while yawing hard)
++  3. each cell of a grid over the central forward region fits brightness constancy with a local similarity
++     motion  u = a + s x - w y,  v = b + s y + w x   (a, b: shift, s: expansion, w: roll). s / dt is
++     1 / time-to-contact of that patch: a surface at distance Z approached at speed V gives s / dt = V / Z.
++     Sideways motion (parallax) only shifts a cell, so it does not count as looming.
++  4. pixels inside the excluded boxes (the locked person: they are SUPPOSED to be ahead) have no weight.
++     A cell only reports when its expansion is measurable (standard error below max_se_per_s): a blank
++     wall or a dark room gives NO looming, which is not the same as "clear" (see LoomingObs.texture).
++The drone's own FORWARD motion is not removed here (it is exactly what makes a static obstacle loom):
++the follow behaviour turns rate into a distance with the speed it commanded (behaviors/follow_avoid.py).
++"""
++
++from __future__ import annotations
++
++import math
++import time
++from abc import ABC, abstractmethod
++from collections import deque
++
++import cv2
++import numpy as np
++
++from ..types import LoomingObs
++
++
++class LoomingEstimator(ABC):
++    @abstractmethod
++    def update(self, image: np.ndarray, t: float, exclude: list | None = None) -> LoomingObs:
++        """image: BGR (or grey) frame; t: frame time (s); exclude: boxes (x1, y1, x2, y2) in pixels to ignore."""
++
++    def reset(self) -> None:
++        """Forget old frames (after a jump: a discrete move/rotation, a mode change)."""
++
++
++class NullLooming(LoomingEstimator):
++    """Never looms. Used to disable the slot without special cases elsewhere."""
++
++    def update(self, image, t, exclude=None) -> LoomingObs:
++        return LoomingObs(t)
++
++
++class DivergenceLooming(LoomingEstimator):
++    def __init__(self, width: int = 96, height: int = 72, roi=(0.15, 0.15, 0.85, 0.85), grid=(3, 4),
++                 baseline_s: float = 0.12, max_baseline_s: float = 0.4, blur: int = 5, max_se_per_s: float = 0.12,
++                 min_rate: float = 0.05, smooth: float = 0.5, gain: float = 1.0, exclude_margin: float = 0.15,
++                 fov_deg: float = 55.0, derotate: bool = True):
++        """baseline_s: compare with the frame this long ago (longer = more sensitive, more motion to undo).
++        max_se_per_s: a cell reports only if its rate is known to +-this (1/s). min_rate: below this nothing
++        looms (TTC > 1 / min_rate s). smooth: EMA weight of the previous rate per cell. gain: score = rate * gain.
++        fov_deg: horizontal field of view of the stream (for the rotation homography; Tello stream ~55 deg)."""
++        self.w, self.h = int(width), int(height)
++        self.roi = tuple(float(v) for v in roi)
++        self.rows, self.cols = int(grid[0]), int(grid[1])
++        self.baseline_s, self.max_baseline_s = baseline_s, max_baseline_s
++        self.blur = int(blur) | 1
++        self.max_se_per_s, self.min_rate, self.smooth, self.gain = max_se_per_s, min_rate, smooth, gain
++        self.exclude_margin = exclude_margin
++        self.derotate = derotate
++        self.f = (self.w / 2.0) / math.tan(math.radians(fov_deg) / 2.0)
++        self.K = np.array([[self.f, 0.0, self.w / 2.0], [0.0, self.f, self.h / 2.0], [0.0, 0.0, 1.0]])
++        self.K_inv = np.linalg.inv(self.K)
++        # cell layout inside the ROI (whole pixels, same size for every cell)
++        x0, y0 = int(round(self.roi[0] * self.w)), int(round(self.roi[1] * self.h))
++        self.cw = max(4, int(round((self.roi[2] - self.roi[0]) * self.w / self.cols)))
++        self.ch = max(4, int(round((self.roi[3] - self.roi[1]) * self.h / self.rows)))
++        self.x0, self.y0 = x0, y0
++        xl = np.arange(self.cw, dtype=np.float32) - (self.cw - 1) / 2.0
++        yl = np.arange(self.ch, dtype=np.float32) - (self.ch - 1) / 2.0
++        self._xl, self._yl = np.meshgrid(xl, yl)  # local coordinates inside a cell (ch, cw)
++        xg = np.arange(self.cols * self.cw, dtype=np.float32) - (self.cols * self.cw - 1) / 2.0
++        yg = np.arange(self.rows * self.ch, dtype=np.float32) - (self.rows * self.ch - 1) / 2.0
++        self._xg, self._yg = np.meshgrid(xg, yg)  # coordinates over the whole ROI (one big cell)
++        self.hist: deque = deque(maxlen=30)  # (t, grey small image, exclusion mask)
++        self._ema: np.ndarray | None = None
++        self._g_ema: float | None = None
++
++    def reset(self) -> None:
++        self.hist.clear()
++        self._ema = None
++        self._g_ema = None
++
++    # ------------------------------------------------------------------ helpers
++    def _small(self, image: np.ndarray) -> np.ndarray:
++        g = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
++        g = cv2.resize(g, (self.w, self.h), interpolation=cv2.INTER_AREA).astype(np.float32)
++        return cv2.GaussianBlur(g, (self.blur, self.blur), 0) if self.blur > 1 else g
++
++    def _mask(self, exclude, full_w: int, full_h: int) -> np.ndarray:
++        m = np.ones((self.h, self.w), np.float32)
++        sx, sy = self.w / full_w, self.h / full_h
++        for b in exclude or []:
++            x1, y1, x2, y2 = b
++            mx, my = self.exclude_margin * (x2 - x1), self.exclude_margin * (y2 - y1)
++            c0, c1 = max(0, int((x1 - mx) * sx)), min(self.w, int(math.ceil((x2 + mx) * sx)))
++            r0, r1 = max(0, int((y1 - my) * sy)), min(self.h, int(math.ceil((y2 + my) * sy)))
++            m[r0:r1, c0:c1] = 0.0
++        return m
++
++    def _rotation(self, dx: float, dy: float) -> np.ndarray:
++        """Homography prev -> cur of a pure camera rotation that shifts the image centre by (dx, dy) px."""
++        yaw, pitch = math.atan2(dx, self.f), -math.atan2(dy, self.f)
++        cy, sy, cp, sp = math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch)
++        r_yaw = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
++        r_pitch = np.array([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]])
++        return self.K @ r_yaw @ r_pitch @ self.K_inv
++
++    def _shift(self, prev: np.ndarray, cur: np.ndarray) -> tuple[float, float]:
++        """Global image shift prev -> cur (px): gradient-weighted Lucas-Kanade, coarse to fine. Strong edges
++        dominate, so a static pattern (sensor dirt, the simulator's fixed noise) does not pin it at zero."""
++        dx = dy = 0.0
++        for scale in (0.25, 0.5, 1.0):
++            w, h = max(8, int(self.w * scale)), max(8, int(self.h * scale))
++            p = cv2.resize(prev, (w, h), interpolation=cv2.INTER_AREA) if scale < 1 else prev
++            c = cv2.resize(cur, (w, h), interpolation=cv2.INTER_AREA) if scale < 1 else cur
++            for _ in range(2):
++                M = np.float32([[1, 0, dx * scale], [0, 1, dy * scale]])
++                pw = cv2.warpAffine(p, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
++                gy, gx = np.gradient(0.5 * (pw + c))
++                gt = (c - pw)[2:-2, 2:-2]
++                gx, gy = gx[2:-2, 2:-2], gy[2:-2, 2:-2]
++                A = np.array([[(gx * gx).sum(), (gx * gy).sum()], [(gx * gy).sum(), (gy * gy).sum()]]) + 1e-3 * np.eye(2)
++                u = np.linalg.solve(A, -np.array([(gx * gt).sum(), (gy * gt).sum()]))
++                dx, dy = dx + float(u[0]) / scale, dy + float(u[1]) / scale
++        return dx, dy
++
++    def _cells(self, a: np.ndarray) -> np.ndarray:
++        """(h, w) -> (rows, cols, ch, cw) over the ROI."""
++        a = a[self.y0:self.y0 + self.rows * self.ch, self.x0:self.x0 + self.cols * self.cw]
++        return a.reshape(self.rows, self.ch, self.cols, self.cw).transpose(0, 2, 1, 3)
++
++    # ------------------------------------------------------------------ main
++    def update(self, image: np.ndarray, t: float, exclude: list | None = None) -> LoomingObs:
++        t0 = time.perf_counter()
++        cur = self._small(image)
++        mask = self._mask(exclude, image.shape[1], image.shape[0])
++        # the frame ~baseline_s ago (the newest one at least that old)
++        prev = None
++        for item in reversed(self.hist):
++            if t - item[0] >= self.baseline_s - 1e-6:
++                prev = item
++                break
++        self.hist.append((t, cur, mask))
++        out = LoomingObs(t, roi=self.roi)
++        if prev is None or t - prev[0] > self.max_baseline_s or t <= prev[0]:
++            self._ema = self._g_ema = None
++            out.latency_ms = 1000.0 * (time.perf_counter() - t0)
++            return out
++        dt = t - prev[0]
++        p_img, p_mask = prev[1], prev[2]
++        valid = mask * p_mask
++        if self.derotate:
++            dx, dy = self._shift(p_img, cur)
++            if abs(dx) < 0.3 * self.w and abs(dy) < 0.3 * self.h:
++                # a plain shift: on simulator renders it left a smaller residual than the full rotation homography
++                # (self._rotation, kept for a real-drone comparison); fast turns are gated in follow_avoid.py
++                M = np.float32([[1, 0, dx], [0, 1, dy]])
++                p_img = cv2.warpAffine(p_img, M, (self.w, self.h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
++                inside = cv2.warpAffine(np.ones_like(cur), M, (self.w, self.h), flags=cv2.INTER_NEAREST)
++                valid = mask * cv2.warpAffine(p_mask, M, (self.w, self.h), flags=cv2.INTER_NEAREST) * inside
++        avg = 0.5 * (cur + p_img)
++        iy, ix = np.gradient(avg)
++        it = cur - p_img
++        # per cell, with local coordinates
++        rate, se, n = self._fit(self._cells(ix), self._cells(iy), self._cells(it), self._cells(valid), self._xl, self._yl, dt)
++        # the whole ROI as one more cell: a doorway or a box with an edge on each side is measurable as a whole
++        # even when every small cell sees a single edge (one edge alone cannot tell expansion from a shift)
++        roi = (slice(self.y0, self.y0 + self.rows * self.ch), slice(self.x0, self.x0 + self.cols * self.cw))
++        g_rate, g_se, g_n = self._fit(*(a[roi][None, None] for a in (ix, iy, it, valid)), self._xg, self._yg, dt)
++        min_n = 0.5 * self.ch * self.cw
++        ok = (n >= min_n) & (se <= self.max_se_per_s)
++        rate = np.where(ok, rate, np.nan)
++        if self._ema is not None:
++            both = ok & np.isfinite(self._ema)
++            rate = np.where(both, (1.0 - self.smooth) * rate + self.smooth * self._ema, rate)
++        self._ema = rate
++        g_ok = bool(g_n[0, 0] >= 2 * min_n and g_se[0, 0] <= self.max_se_per_s)
++        g_val = float(g_rate[0, 0]) if g_ok else math.nan
++        if g_ok and self._g_ema is not None and math.isfinite(self._g_ema):
++            g_val = (1.0 - self.smooth) * g_val + self.smooth * self._g_ema
++        self._g_ema = g_val
++        out.cells, out.dt_s = rate, dt
++        out.texture = float(ok.mean()) if not g_ok else max(float(ok.mean()), 0.5)
++        best, x_frac = -math.inf, 0.5
++        if ok.any():
++            k = int(np.nanargmax(rate))
++            best = float(rate.flat[k])
++            x_frac = (self.x0 + (k % self.cols + 0.5) * self.cw) / self.w
++        if g_ok and g_val > best:
++            best, x_frac = g_val, 0.5
++        if best > -math.inf:
++            if best >= self.min_rate:
++                out.rate, out.ttc_s, out.x_frac = best, 1.0 / best, x_frac
++            out.score = float(np.clip(max(best, 0.0) * self.gain, 0.0, 1.0))
++        out.latency_ms = 1000.0 * (time.perf_counter() - t0)
++        return out
++
++    @staticmethod
++    def _fit(IX, IY, IT, W, xl, yl, dt):
++        """Weighted least squares of brightness constancy with a similarity motion, for a batch of cells.
++        Returns (expansion rate 1/s, its standard error 1/s, weighted pixel count), each (rows, cols)."""
++        g = np.stack([IX, IY, IX * xl + IY * yl, IY * xl - IX * yl], axis=-1)  # (r, c, ch, cw, 4)
++        gw = g * W[..., None]
++        M = np.einsum("rcyxi,rcyxj->rcij", gw, g) + 1e-3 * np.eye(4, dtype=np.float32)
++        rhs = -np.einsum("rcyxi,rcyx->rci", gw, IT)
++        n = W.sum(axis=(2, 3))
++        M_inv = np.linalg.inv(M)
++        p = np.einsum("rcij,rcj->rci", M_inv, rhs)
++        resid = IT + np.einsum("rcyxi,rci->rcyx", g, p)
++        # at least 1 grey level of noise: a perfectly flat patch (a blank wall) is unmeasurable, not "certain"
++        sigma2 = np.maximum((W * resid ** 2).sum(axis=(2, 3)) / np.maximum(n - 4.0, 1.0), 1.0)
++        se = np.sqrt(np.maximum(sigma2 * M_inv[..., 2, 2], 0.0)) / dt
++        return p[..., 2] / dt, se, n
+diff --git a/reachglass/mapping/odometry.py b/reachglass/mapping/odometry.py
+index 66c943c..c666c8d 100644
+--- a/reachglass/mapping/odometry.py
++++ b/reachglass/mapping/odometry.py
+@@ -4,7 +4,8 @@ The mission frame starts where the drone is when the search begins (x = its head
+ Heading comes from the IMU yaw relative to that moment (clockwise +, sign checked at the first real
+ rotation: if the drone reports the opposite direction to what we commanded, yaw_sign is flipped).
+ Position advances by the COMMANDED distance of each completed move (the Tello closes that loop itself
+-with its optical-flow hold), times `move_scale` (calibrate on the venue floor).
++with its optical-flow hold), times `move_scale` (calibrate on the venue floor). While following with rc,
++follow.avoid advances it by the commanded rc speed (on_velocity), so obstacles stay put on the map.
+ """
+ 
+ from __future__ import annotations
+@@ -60,6 +61,15 @@ class Odometry:
+         elif e_same < 20:
+             self.sign_checked = True
+ 
++    def on_velocity(self, forward_mps: float, right_mps: float, dt: float, path_every_m: float = 0.25) -> Pose2D:
++        """Continuous rc flight (following): advance by a body-frame velocity for dt seconds. The follow
++        behaviour passes the speed it COMMANDED (through the stick lag), like a discrete move's distance."""
++        self.pose = self.pose.moved(forward_m=forward_mps * dt * self.move_scale, right_m=right_mps * dt * self.move_scale)
++        lx, ly = self.path[-1]
++        if (self.pose.x - lx) ** 2 + (self.pose.y - ly) ** 2 >= path_every_m ** 2:
++            self.path.append((self.pose.x, self.pose.y))
++        return self.pose
++
+     def on_move_done(self, direction: str, cm: float, tel: Telemetry | None = None) -> Pose2D:
+         self.update(tel)  # heading from telemetry, or from the commanded rotations when there is none
+         d = cm / 100.0 * self.move_scale
+diff --git a/reachglass/mission/mission.py b/reachglass/mission/mission.py
+index 4497da4..5bfbc65 100644
+--- a/reachglass/mission/mission.py
++++ b/reachglass/mission/mission.py
+@@ -16,7 +16,7 @@ import logging
+ import math
+ from typing import Callable
+ 
+-from ..behaviors import FAILURE, RUNNING, SUCCESS, Approach, Behavior, Ctx, Discrete, Explore, FollowBehind, ReacquirePerson
++from ..behaviors import FAILURE, RUNNING, SUCCESS, Approach, Behavior, Ctx, Discrete, Explore, FollowAvoid, ReacquirePerson
+ from ..mapping import Grid, SemanticMemory
+ from ..query import ParsedQuery, QueryParser
+ from ..types import wrap_deg
+@@ -79,7 +79,7 @@ class Mission:
+             self.ctx.drone.takeoff()
+             self._go("TAKEOFF", "start")
+         else:
+-            self._go("FOLLOW", "no takeoff (ground / dry run)", FollowBehind(self.ctx.cfg.follow))
++            self._go("FOLLOW", "no takeoff (ground / dry run)", FollowAvoid(self.ctx.cfg.follow))
+ 
+     def query(self, text: str) -> None:
+         self._pending.append(text)
+@@ -233,20 +233,23 @@ class Mission:
+                 alt = ctx.altitude
+                 cm = int(round((cfg.follow.altitude_m - alt) * 100)) if alt is not None else 0
+                 if cm < 20:
+-                    self._go("FOLLOW", "at follow altitude", FollowBehind(cfg.follow))
++                    self._go("FOLLOW", "at follow altitude", FollowAvoid(cfg.follow))
+                     return
+                 self.cmd = Discrete("move", min(cm, 200), "up")
+             r = self.cmd.step(ctx)
+             if r != RUNNING:
+                 self.cmd = None
+-                self._go("FOLLOW", "climbed" if r == SUCCESS else f"climb: {d.last_result()}", FollowBehind(cfg.follow))
++                self._go("FOLLOW", "climbed" if r == SUCCESS else f"climb: {d.last_result()}", FollowAvoid(cfg.follow))
+         elif st == "FOLLOW":
+             if self._deferred is not None:
+                 text, self._deferred = self._deferred, None
+                 self._handle(text)
+                 return
+             self.child.step(ctx)
+-            if ctx.res is not None and ctx.res.person_unseen_s > 20.0 and ctx.now - self.state_t > 20.0:
++            # follow.avoid: an obstacle hides the person and the follow behaviour is going round it (bounded)
++            waiting = getattr(self.child, "reacquire_wait", False)
++            if (not waiting and ctx.res is not None and ctx.res.person_unseen_s > 20.0
++                    and ctx.now - self.state_t > 20.0):
+                 self._reacquire("person lost for 20 s")
+         elif st == "DESCEND":
+             if self.cmd is None:
+@@ -336,7 +339,7 @@ class Mission:
+             return
+         r = self.child.step(ctx)
+         if r == SUCCESS:
+-            self._go("FOLLOW", "person found", FollowBehind(cfg.follow))
++            self._go("FOLLOW", "person found", FollowAvoid(cfg.follow))
+         elif r == FAILURE:
+             self.announce("I can't see you. Say 'follow me' when you're in front of me, or 'land'.")
+             self._go("HOLD", "person not found")
+diff --git a/reachglass/perception.py b/reachglass/perception.py
+index 9552990..52c022d 100644
+--- a/reachglass/perception.py
++++ b/reachglass/perception.py
+@@ -9,6 +9,7 @@ Detectors per role, each swappable in config:
+   person   people (+ keypoints) -> locked person, range, facing
+   target   the thing we look for (dummy colour blob now, trained bottle model later)
+   context  furniture etc. for the exploration prior; also a second source of targets (e.g. "chair")
++  looming  not a detector: expansion of the forward view outside the locked person (res.looming, follow.avoid)
+ """
+ 
+ from __future__ import annotations
+@@ -16,7 +17,7 @@ from __future__ import annotations
+ import time
+ 
+ from .config import Config
+-from .detect import DETECTORS, Detector
++from .detect import DETECTORS, LOOMING, Detector, LoomingEstimator
+ from .geometry import CameraModel, camera_from_config
+ from .person import PersonEstimator
+ from .track import SimpleTracker, TargetLock, largest, most_confident
+@@ -28,13 +29,23 @@ MIN_WIDTH_PX = 25  # below this a width-based range is too coarse and blur-infla
+ 
+ class Perception:
+     def __init__(self, cfg: Config, person: Detector | None = None, target: Detector | None = None,
+-                 context: Detector | None = None, camera: CameraModel | None = None):
++                 context: Detector | None = None, camera: CameraModel | None = None,
++                 looming: LoomingEstimator | None = None):
+         self.cfg = cfg
+         pc, tc = cfg.perception, cfg.tracking
+         self.detectors = {"person": person, "target": target, "context": context}
++        # no model to load, so it is built from the config unless given (also on the simulator's frames)
++        self.looming = looming if looming is not None else LOOMING.build(pc.looming)
++        self._locked_box: tuple | None = None  # the locked person's latest box (kept out of the looming)
++        self._locked_box_t = -1e9
+         self.camera = camera or camera_from_config(cfg.camera)
+         self.tracker = SimpleTracker(tc.iou_match, tc.center_match_frac, tc.max_age_s)
+-        self.person_lock = TargetLock(self.tracker, tc.confirm_hits, tc.confirm_window, 0.99, tc.lost_after_s, select=largest)
++        # the person to follow is the NEAREST one: from 2 m up a wearer close ahead shows only a head, so the largest
++        # box can be a bystander further away (largest is the fallback when no range is known)
++        self.person_lock = TargetLock(self.tracker, tc.confirm_hits, tc.confirm_window, 0.99, tc.lost_after_s,
++                                      select=self._nearest_person)
++        self.not_the_person: set[int] = set()  # track ids the follow behaviour ruled out (bystanders)
++        self._person_range: dict = {}
+         self.person_lock.set_class("person")
+         self.target_lock = TargetLock(self.tracker, tc.confirm_hits, tc.confirm_window, tc.confirm_conf, tc.lost_after_s,
+                                       select=most_confident, plausible=self._plausible_target)
+@@ -62,6 +73,8 @@ class Perception:
+             raise ValueError(f"mode must be one of {MODES}")
+         if mode != self.mode:
+             self._mode_i = 0  # every detector runs on the first frame of a new mode, then by stride
++            if self.looming is not None:
++                self.looming.reset()  # frames from another mode (other height, discrete moves) are not comparable
+         self.mode = mode
+ 
+     def set_target(self, cls: str | None) -> None:
+@@ -83,8 +96,15 @@ class Perception:
+         self.tracker.reset()
+         self.person_lock.release()
+         self.target_lock.release()
++        if self.looming is not None:
++            self.looming.reset()
+ 
+     # ------------------------------------------------------------------ helpers
++    def _nearest_person(self, cands: list[Detection]) -> Detection:
++        ok = [d for d in cands if d.track_id not in self.not_the_person] or cands
++        ranged = [d for d in ok if self._person_range.get(d.track_id) is not None]
++        return min(ranged, key=lambda d: self._person_range[d.track_id]) if ranged else largest(ok)
++
+     def _plausible_target(self, det: Detection) -> bool:
+         """Single-frame confirmation needs a plausible distance AND shape (a blue blob of any shape is not
+         a bottle; upright or lying, the long/short side ratio must be within 2x of the prior's)."""
+@@ -149,8 +169,14 @@ class Perception:
+         stride = self.cfg.perception.stride.get(self.mode, {}).get(role, 0)
+         if self.mode in ("search", "approach") and role == self.owner_of(self.target_cls):
+             stride = 1  # whoever reports the target runs every frame (e.g. the context detector for "chair")
++        if self.mode == "follow" and role == "target" and not self.target_cls:
++            return False  # following: the target detector only runs once there is a target (after a search)
+         return bool(stride) and self._mode_i % stride == 0
+ 
++    def _run_looming(self) -> bool:
++        stride = self.cfg.perception.stride.get(self.mode, {}).get("looming", 0)
++        return self.looming is not None and bool(stride) and self._mode_i % stride == 0
++
+     # ------------------------------------------------------------------ main
+     def update(self, frame: Frame, telemetry: Telemetry | None = None) -> PerceptionResult:
+         if self.last is not None and frame.seq == self.last.seq and frame.t == self.last.t:
+@@ -183,6 +209,9 @@ class Perception:
+         persons = [d for d in dets if d.cls == "person"]
+         res.persons = [self.estimator.estimate(d, cam, altitude, pitch) for d in persons]
+         if ran["person"] or persons:
++            self._person_range = {p.det.track_id: (p.range_lo_m or p.range_m) for p in res.persons}
++            if self.person_lock.state.track_id in self.not_the_person:
++                self.person_lock.release()  # locked onto someone the follow behaviour says is not the user
+             ps = self.person_lock.update(dets, frame.t, (frame.width, frame.height))
+             if ps.det is not None:
+                 res.person = next((p for p in res.persons if p.det.track_id == ps.det.track_id), None)
+@@ -197,6 +226,13 @@ class Perception:
+                         res.target = tob
+                     res.targets.append(tob)
+         res.context = [self._object_obs(d, cam, pitch) for d in dets if d.cls not in ("person", self.target_cls)]
++        if res.person is not None:
++            self._locked_box, self._locked_box_t = res.person.det.bbox, frame.t
++        if self._run_looming():
++            # the person we follow is SUPPOSED to be ahead: their box (or the last one, through a short
++            # detector dropout) is not looming
++            keep_out = [self._locked_box] if (self._locked_box is not None and frame.t - self._locked_box_t < 0.5) else []
++            res.looming = self.looming.update(frame.image, frame.t, keep_out)
+         res.ran = ran
+         res.person_unseen_s = self.person_lock.unseen_s(frame.t)
+         res.target_unseen_s = self.target_lock.unseen_s(frame.t) if self.target_cls else float("inf")
+diff --git a/reachglass/runlog.py b/reachglass/runlog.py
+index 24c5a09..5c73b79 100644
+--- a/reachglass/runlog.py
++++ b/reachglass/runlog.py
+@@ -59,6 +59,9 @@ class RunLog:
+                 rec["target"] = {"cls": r.target.cls, "range": r.target.range_m, "bearing": round(r.target.bearing_deg, 1),
+                                  "confirmed": r.target.confirmed}
+             rec["n_det"] = len(r.detections)
++            if r.looming is not None:
++                rec["loom"] = {"ttc": None if r.looming.ttc_s is None else round(r.looming.ttc_s, 2),
++                               "rate": round(r.looming.rate, 3), "tex": round(r.looming.texture, 2)}
+         self._write(rec)
+ 
+     def close(self) -> None:
+diff --git a/reachglass/sim/follow_scenarios.py b/reachglass/sim/follow_scenarios.py
+new file mode 100644
+index 0000000..fe0bdf1
+--- /dev/null
++++ b/reachglass/sim/follow_scenarios.py
+@@ -0,0 +1,92 @@
++"""Following with obstacles in the way (follow.avoid), for tests/test_follow_avoid.py and the simulator:
++
++    python -m reachglass sim --scenario doorway --headless --record doorway.mp4 --seconds 45
++
++Each returns (world, drone_xy, drone_heading) like runner.demo_scenario; no query is sent, so the mission
++takes off and follows. doorway: ducks under the header; floor_lamp / bystander / box_in_path: goes round. The drone follows at 2.0 m, so low furniture (chairs, tables) is flown over: what
++can hit it at that height is tall furniture, a door header (2.03 m) and walls. Tall things here are drawn
++with texture where real ones have it (books, a printed carton) and flat where real ones are flat (walls).
++"""
++
++from __future__ import annotations
++
++from .person_model import SimPerson
++from .world import Box, PersonScript, World
++
++WALL = (175, 180, 185)
++FRAME = (60, 70, 80)
++
++
++def _world(boxes, script, size=(9.0, 7.0)) -> World:
++    w = World(size_x=size[0], size_y=size[1], boxes=boxes)
++    w.person = SimPerson(*script.at(0.0))
++    w.person_script = script
++    return w
++
++
++def table_pass():
++    """The user walks past a dining table and chairs and around the end of a tall bookcase (1.95 m, books):
++    the straight line from the drone to the user cuts the bookcase's corner. The table and chairs are
++    below flight height: the drone must fly over them without braking."""
++    boxes = [
++        Box((3.2, 1.0, 0.0), (4.6, 2.0, 0.75), (60, 90, 120), "dining table"),
++        Box((3.5, 2.1, 0.0), (3.9, 2.5, 0.9), (70, 120, 160), "chair"),
++        Box((5.0, 2.4, 0.0), (5.4, 4.6, 1.95), (40, 80, 130), "", texture_m=0.12),  # bookcase across the room
++    ]
++    script = PersonScript([(0.0, 2.4, 3.2, 0.0), (8.0, 2.4, 3.2, 0.0), (16.0, 4.4, 4.9, 40.0), (19.0, 5.2, 5.3, 20.0),
++                           (24.0, 6.4, 5.2, -20.0), (30.0, 6.9, 3.6, -80.0), (60.0, 6.9, 3.6, -80.0)])
++    return _world(boxes, script), (1.2, 3.0), 0.0
++
++
++def doorway():
++    """A wall across the room with a 0.9 m door; its header is at 2.03 m, just above the drone's 2.0 m. The user
++    walks through and on into the next room. Without braking the drone flies into the header / wall."""
++    boxes = [
++        Box((4.5, 0.0, 0.0), (4.6, 3.0, 2.6), WALL, ""),
++        Box((4.5, 3.9, 0.0), (4.6, 7.0, 2.6), WALL, ""),
++        Box((4.5, 3.0, 2.03), (4.6, 3.9, 2.6), WALL, ""),  # header
++        Box((4.45, 2.92, 0.0), (4.65, 3.0, 2.1), FRAME, ""),  # door frame (jambs + head)
++        Box((4.45, 3.9, 0.0), (4.65, 3.98, 2.1), FRAME, ""),
++        Box((4.45, 3.0, 2.03), (4.65, 3.9, 2.1), FRAME, ""),
++    ]
++    script = PersonScript([(0.0, 2.2, 3.45, 0.0), (8.0, 2.2, 3.45, 0.0), (19.0, 5.6, 3.45, 0.0), (24.0, 7.2, 3.45, 0.0),
++                           (60.0, 7.2, 3.45, 0.0)])
++    return _world(boxes, script), (1.0, 3.45), 0.0
++
++
++def box_in_path():
++    """A tall carton (wardrobe box, 1.95 m, printed) stands in the path; the user steps around it on the left
++    and walks on. The drone's straight path to the user goes through the box."""
++    boxes = [Box((4.6, 2.6, 0.0), (5.2, 3.6, 1.95), (70, 130, 170), "", texture_m=0.15)]
++    script = PersonScript([(0.0, 2.6, 3.1, 0.0), (8.0, 2.6, 3.1, 0.0), (13.0, 4.0, 3.1, 0.0), (17.0, 4.8, 4.2, 60.0),
++                           (22.0, 6.2, 4.2, 0.0), (26.0, 7.2, 3.2, -45.0), (60.0, 7.2, 3.2, -45.0)])
++    return _world(boxes, script), (1.4, 3.1), 0.0
++
++
++def floor_lamp():
++    """A floor lamp (torchiere: thin pole, shade 1.45-1.85 m) stands in the path; the user steps round it and walks
++    on. The shade is within 0.2 m of the drone's 2.0 m, so it counts as an obstacle (a 1.7 m lamp is flown over).
++    Detected as "floor lamp", boxed whole like YOLO-World prompted "floor lamp" would (COCO YOLO has no lamp)."""
++    boxes = [
++        Box((4.15, 3.05, 0.0), (4.45, 3.35, 0.04), (40, 40, 40), ""),  # base
++        Box((4.28, 3.18, 0.04), (4.32, 3.22, 1.45), (60, 60, 60), ""),  # pole
++        Box((4.07, 2.97, 1.45), (4.53, 3.43, 1.85), (180, 225, 235), "", texture_m=0.1),  # shade
++        Box((4.07, 2.97, 0.0), (4.53, 3.43, 1.85), (0, 0, 0), "floor lamp", solid=False, visible=False),  # its box
++    ]
++    script = PersonScript([(0.0, 2.4, 3.2, 0.0), (8.0, 2.4, 3.2, 0.0), (12.0, 3.6, 3.2, 0.0), (15.0, 4.3, 2.55, 0.0),
++                           (18.0, 5.2, 3.2, 0.0), (24.0, 7.0, 3.2, 0.0), (60.0, 7.0, 3.2, 0.0)])
++    return _world(boxes, script), (1.2, 3.2), 0.0
++
++
++def bystander():
++    """Someone stands in the path, facing the drone; the user walks round them (1 m away) and on. The drone must
++    keep 1 m from the bystander and keep following the user, never them."""
++    script = PersonScript([(0.0, 2.4, 3.2, 0.0), (8.0, 2.4, 3.2, 0.0), (12.0, 3.5, 3.2, 0.0), (15.5, 4.4, 2.2, 0.0),
++                           (19.0, 5.6, 3.2, 0.0), (24.0, 7.2, 3.2, 0.0), (60.0, 7.2, 3.2, 0.0)])
++    w = _world([], script)
++    w.bystanders = [SimPerson(4.4, 3.25, 180.0, 1.72)]
++    return w, (1.2, 3.2), 0.0
++
++
++SCENARIOS = {"table_pass": table_pass, "doorway": doorway, "box_in_path": box_in_path, "floor_lamp": floor_lamp,
++             "bystander": bystander}
+diff --git a/reachglass/sim/scenario.py b/reachglass/sim/scenario.py
+index 33de9c9..2097d55 100644
+--- a/reachglass/sim/scenario.py
++++ b/reachglass/sim/scenario.py
+@@ -60,21 +60,26 @@ class SimPersonDetector(Detector):
+         t = self.sim.t
+         if meta is None or w.person is None or meta[2] is None:
+             return []
++        others = [d for d in (b.detect(meta[0], self.sim.cam, self.rng, self.px_noise) for b in w.bystanders
++                              if self._visible(meta[0], b)) if d is not None]
+         if t < self._burst_until:
+-            return []
++            return others
+         if self.rng.random() < self.burst_prob:
+             self._burst_until = t + self.rng.uniform(0.3, 1.0)
+-            return []
++            return others
+         if self.rng.random() < self.dropout:
+-            return []
++            return others
+         pose, _, (px, py, ph) = meta
+         person = SimPerson(px, py, ph, w.person.height_m)
+-        eye = (pose.x, pose.y, pose.z)
+-        s = person.height_m / 1.75
+-        if not any(w.line_of_sight(eye, (px, py, z * s), include_person=False) for z in (1.6, 1.2, 0.6)):
+-            return []  # hidden behind furniture
++        if not self._visible(pose, person):
++            return others  # hidden behind furniture
+         det = person.detect(pose, self.sim.cam, self.rng, self.px_noise)
+-        return [self._faults(det)] if det is not None else []
++        return ([self._faults(det)] if det is not None else []) + others
++
++    def _visible(self, pose, person: SimPerson) -> bool:
++        s = person.height_m / 1.75
++        return any(self.sim.world.line_of_sight((pose.x, pose.y, pose.z), (person.x, person.y, z * s), include_person=False)
++                   for z in (1.6, 1.2, 0.6))
+ 
+ 
+ class SimContextDetector(Detector):
+diff --git a/reachglass/sim/world.py b/reachglass/sim/world.py
+index f24650f..aa44ff4 100644
+--- a/reachglass/sim/world.py
++++ b/reachglass/sim/world.py
+@@ -20,6 +20,8 @@ class Box:
+     color: tuple[int, int, int] = (90, 110, 140)  # BGR
+     cls: str = ""  # detector class name for the oracle ("" = not detectable, e.g. a wall pillar)
+     solid: bool = True  # the drone collides with it
++    texture_m: float = 0.0  # checker period on its faces (books on a shelf, a printed carton); 0 = flat colour
++    visible: bool = True  # False: only the oracle detector sees it (e.g. the box a detector draws round a floor lamp)
+ 
+     @property
+     def center(self) -> tuple[float, float, float]:
+@@ -55,6 +57,7 @@ class World:
+     boxes: list[Box] = field(default_factory=list)
+     person: SimPerson | None = None
+     person_script: PersonScript | None = None
++    bystanders: list[SimPerson] = field(default_factory=list)  # other people standing in the room (not followed)
+ 
+     def update(self, t: float) -> None:
+         if self.person is not None and self.person_script is not None:
+@@ -62,15 +65,15 @@ class World:
+ 
+     def person_boxes(self) -> list[Box]:
+         """The person as three boxes (legs, torso, head) for rendering and collisions. Blue jeans (the same
+-        hue as the dummy: the person guard must drop them), a grey-green top."""
+-        p = self.person
+-        if p is None:
+-            return []
+-        s = p.height_m / 1.75
++        hue as the dummy: the person guard must drop them), a grey-green top. Bystanders wear a red top."""
+         out = []
+-        for (hw, z0, z1, col) in ((0.13, 0.0, 0.9, (90, 50, 40)), (0.22, 0.9, 1.5, (80, 110, 90)), (0.10, 1.5, 1.75, (120, 150, 190))):
+-            hw_s = hw * s
+-            out.append(Box((p.x - hw_s, p.y - hw_s, z0 * s), (p.x + hw_s, p.y + hw_s, z1 * s), col, "person"))
++        for p, top in [(self.person, (80, 110, 90))] + [(b, (60, 60, 170)) for b in self.bystanders]:
++            if p is None:
++                continue
++            s = p.height_m / 1.75
++            for (hw, z0, z1, col) in ((0.13, 0.0, 0.9, (90, 50, 40)), (0.22, 0.9, 1.5, top), (0.10, 1.5, 1.75, (120, 150, 190))):
++                hw_s = hw * s
++                out.append(Box((p.x - hw_s, p.y - hw_s, z0 * s), (p.x + hw_s, p.y + hw_s, z1 * s), col, "person"))
+         return out
+ 
+     def all_boxes(self) -> list[Box]:
+@@ -80,7 +83,7 @@ class World:
+         """Height of the surface under (x, y) below z (floor or a box top)."""
+         top = 0.0
+         for b in self.all_boxes():
+-            if b.lo[0] <= x <= b.hi[0] and b.lo[1] <= y <= b.hi[1] and b.hi[2] <= z:
++            if b.visible and b.lo[0] <= x <= b.hi[0] and b.lo[1] <= y <= b.hi[1] and b.hi[2] <= z:
+                 top = max(top, b.hi[2])
+         return top
+ 
+@@ -115,7 +118,7 @@ class World:
+         a, b = np.asarray(a, float), np.asarray(b, float)
+         d = b - a
+         for bx in (self.all_boxes() if include_person else self.boxes):
+-            if ignore and any(bx is i for i in ignore):
++            if not bx.visible or (ignore and any(bx is i for i in ignore)):
+                 continue
+             t0, t1 = 0.0, 1.0
+             ok = True
+@@ -231,11 +234,17 @@ class Renderer:
+                 color[m] = c
+                 t_best[m] = t[m]
+         for b in world.all_boxes():
++            if not b.visible:
++                continue
+             t, axis = ray_box(o, d, b.lo, b.hi)
+             m = t < t_best
+             if not m.any():
+                 continue
+             shade = np.array([0.8, 0.9, 1.0])[axis[m]][:, None]  # face orientation shading
++            if b.texture_m > 0:
++                pts = o + d[m] * t[m, None]
++                chk = np.floor(pts / b.texture_m).sum(axis=1) % 2
++                shade = shade * (0.65 + 0.35 * chk)[:, None]
+             color[m] = np.array(b.color)[None, :] * shade
+             t_best[m] = t[m]
+         img = color.reshape(self.cam.height, self.cam.width, 3) + self._noise
+diff --git a/reachglass/types.py b/reachglass/types.py
+index 389a44b..d19e70d 100644
+--- a/reachglass/types.py
++++ b/reachglass/types.py
+@@ -173,6 +173,26 @@ class TargetObs(ObjectObs):
+     confirmed: bool = False  # passed the target lock's confirmation rule
+ 
+ 
++@dataclass
++class LoomingObs:
++    """Expansion of the forward view (detect/looming.py): something ahead is getting closer.
++
++    rate = 1 / time-to-contact of the fastest-looming patch that has enough texture (1/s, after smoothing);
++    a surface at distance Z approached at speed V looms at V / Z. The locked person's box is excluded.
++    """
++
++    t: float
++    rate: float = 0.0  # 1/s, 0 = nothing looming (or nothing textured enough to tell)
++    ttc_s: float | None = None  # 1 / rate when something looms, else None
++    score: float = 0.0  # 0..1 looming strength (like the fly's LPLC2 channel)
++    x_frac: float = 0.5  # where the looming patch is, 0 = left edge, 1 = right edge of the image
++    texture: float = 0.0  # fraction of forward cells with enough texture to measure (0 = blind, e.g. a blank wall)
++    cells: np.ndarray | None = None  # (rows, cols) rate per cell, nan = not measurable
++    roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)  # measured region, fractions of the image
++    dt_s: float = 0.0  # time between the two frames compared
++    latency_ms: float = 0.0
++
++
+ @dataclass
+ class PerceptionResult:
+     """Everything perception knows about one frame. Behaviours read only this (plus telemetry/pose)."""
+@@ -190,3 +210,4 @@ class PerceptionResult:
+     ran: dict = field(default_factory=dict)  # role -> did that detector run on this frame
+     person_unseen_s: float = float("inf")  # time since the locked person was last seen
+     target_unseen_s: float = float("inf")
++    looming: LoomingObs | None = None  # None when the looming estimator did not run on this frame
+diff --git a/tests/test_follow_avoid.py b/tests/test_follow_avoid.py
+new file mode 100644
+index 0000000..63e818b
+--- /dev/null
++++ b/tests/test_follow_avoid.py
+@@ -0,0 +1,317 @@
++"""follow.avoid step 2: FollowAvoid (brake, sidestep, keep-outs, yaw untouched) and the follow scenarios."""
++
++import math
++
++import pytest
++
++from reachglass.behaviors import Ctx, FollowAvoid, FollowBehind
++from reachglass.behaviors.follow_avoid import Obstacle
++from reachglass.config import load_config
++from reachglass.mapping import Grid
++from reachglass.perception import Perception
++from reachglass.sim.follow_scenarios import SCENARIOS
++from reachglass.sim.runner import SimRunner
++from reachglass.types import Detection, LoomingObs, PerceptionResult, PersonObs, Telemetry
++
++DT = 1.0 / 15
++
++
++class RecDrone:
++    """Records rc; always flying."""
++
++    flying = True
++
++    def __init__(self):
++        self.sent = []
++
++    def rc(self, lr, fb, ud, yaw):
++        self.sent.append((lr, fb, ud, yaw))
++
++    def busy(self):
++        return False
++
++
++def person(range_m=2.5, bearing=10.0, track=1, box=(440, 300, 520, 380)):
++    det = Detection("person", 0.9, box, track_id=track)
++    return PersonObs(det, bearing, -5.0, range_m, "height_prior", None, 0.0, range_m)
++
++
++def setup(**avoid):
++    avoid = {"use_map": True, **avoid}  # these tests put obstacles into the grid
++    cfg = load_config(overrides={"follow": {"avoid": avoid}})
++    ctx = Ctx(cfg, RecDrone(), Perception(cfg))
++    beh = FollowAvoid(cfg.follow)
++    beh.start(ctx)
++    return ctx, beh
++
++
++def step(ctx, beh, persons, locked=0, t=None, looming=None):
++    """One loop with a fresh frame: persons[locked] is the person we follow (locked=None: nobody locked)."""
++    ctx.now = ctx.now + DT if t is None else t
++    ctx.tel = Telemetry(ctx.now, yaw_deg=0.0, height_m=2.0, tof_m=2.0)
++    ctx.new_frame = True
++    res = PerceptionResult(ctx.now, int(ctx.now * 15), 0.0, (960, 720), [p.det for p in persons])
++    res.persons = persons
++    res.person = persons[locked] if (locked is not None and persons) else None
++    res.person_unseen_s = 0.0 if res.person is not None else 5.0
++    res.ran = {"person": True, "target": False, "context": False}
++    res.looming = looming
++    ctx.res = res
++    beh.step(ctx)
++    return ctx.drone.sent[-1]
++
++
++def run(ctx, beh, seconds, **kw):
++    return [step(ctx, beh, [person(**kw)]) for _ in range(int(seconds / DT))]
++
++
++# ------------------------------------------------------------------ brake
++def test_clear_corridor_follows_like_follow_behind():
++    ctx, beh = setup()
++    lr, fb, ud, yaw = run(ctx, beh, 1.0)[-1]
++    assert fb == 35 and yaw == 7 and lr == 0  # FollowBehind: max_rc_forward, 1.2 x (10 - 4 deg deadband)
++    assert "braking" not in beh.status
++
++
++def test_obstacle_in_corridor_brakes_and_yaw_stays_on_the_person():
++    ctx, beh = setup(sidestep=False)
++    ctx.grid.mark_blocked(0.9, 0.0, 0.2, weight=2.0)  # something tall 0.9 m ahead (unknown height)
++    sent = run(ctx, beh, 2.0)
++    assert all(fb <= 0 for _, fb, _, _ in sent)
++    assert all(yaw == 7 for *_, yaw in sent)  # the fly / PID keeps steering at the person
++    assert "ahead: braking" in beh.status and any(e.startswith("brake") for _, e in beh.events)
++
++
++def test_very_close_obstacle_backs_away_slowly():
++    ctx, beh = setup(sidestep=False)
++    ctx.grid.mark_blocked(0.45, 0.0, 0.1, weight=2.0)
++    _, fb, _, _ = run(ctx, beh, 0.5)[-1]
++    assert fb == -load_config().follow.avoid.reverse_rc
++
++
++def test_low_furniture_below_flight_height_does_not_brake():
++    ctx, beh = setup()
++    ctx.grid.mark_blocked(0.9, 0.0, 0.4, weight=2.0, top_m=0.75)  # a table: the drone at 2.0 m flies over it
++    _, fb, _, _ = run(ctx, beh, 1.0)[-1]
++    assert fb == 35
++
++
++def test_looming_brakes_while_flying_and_is_remembered():
++    ctx, beh = setup(sidestep=False)
++    run(ctx, beh, 1.5)  # flying forward at ~0.35 m/s
++    close = LoomingObs(0.0, rate=0.8, ttc_s=1.25, texture=1.0, dt_s=0.13)  # ~0.4 m at our speed
++    for _ in range(3):
++        close.t = ctx.now + DT
++        _, fb, _, yaw = step(ctx, beh, [person()], looming=close)
++    assert fb <= 0 and yaw == 7 and "looming" in beh.status
++    assert any(o.src == "looming" for o in beh.obstacles)  # kept ahead so a stopped drone does not creep on
++
++
++def test_one_noisy_looming_frame_or_a_fast_turn_does_not_brake():
++    ctx, beh = setup(sidestep=False)
++    run(ctx, beh, 1.5)
++    spike = LoomingObs(ctx.now + DT, rate=0.8, ttc_s=1.25, texture=1.0, dt_s=0.13)
++    _, fb, _, _ = step(ctx, beh, [person()], looming=spike)
++    assert fb > 0  # needs two frames in a row
++    ctx2, beh2 = setup(sidestep=False)
++    run(ctx2, beh2, 1.5, bearing=40.0)  # yaw stick 40: turning hard
++    for _ in range(3):
++        _, fb, _, _ = step(ctx2, beh2, [person(bearing=40.0)], looming=LoomingObs(ctx2.now + DT, 0.8, 1.25, texture=1.0))
++    assert fb > 0
++
++
++# ------------------------------------------------------------------ sidestep and keep-outs
++def test_blocked_for_long_sidesteps_toward_the_person_side():
++    ctx, beh = setup()
++    ctx.grid.mark_blocked(0.9, 0.0, 0.2, weight=2.0)
++    sent = run(ctx, beh, 3.5, bearing=15.0)  # the person is to the right of the obstacle
++    assert any(lr > 0 for lr, *_ in sent) and not any(lr < 0 for lr, *_ in sent)
++    assert all(fb <= 0 for _, fb, _, _ in sent) and all(yaw == 13 for *_, yaw in sent)
++    assert any(e.startswith("sidestep right") for _, e in beh.events)
++    assert ctx.odom.pose.y > 0.3  # dead reckoning moved us right
++
++
++def test_sidestep_never_ends_near_a_person():
++    ctx, beh = setup()
++    ctx.grid.mark_blocked(0.9, 0.0, 0.2, weight=2.0)
++    beh.obstacles.append(Obstacle(1e9, 0.0, -0.55, 0.1, math.inf, "potted plant"))  # no room on the left either
++    # the user straight ahead, a second person 1.2 m away on the right: sliding right would end ~0.8 m from them
++    other = person(range_m=1.2, bearing=80.0, track=2, box=(800, 300, 900, 380))
++    sent = [step(ctx, beh, [person(bearing=15.0), other]) for _ in range(int(3.5 / DT))]
++    assert not any(lr > 0 for lr, *_ in sent)
++    assert not any(e.startswith("sidestep") for _, e in beh.events)
++    assert "no room to sidestep" in beh.status or "braking" in beh.status
++
++
++def test_other_people_are_obstacles_the_followed_person_is_not():
++    ctx, beh = setup(sidestep=False)
++    stranger = person(range_m=1.2, bearing=0.0, track=2, box=(460, 330, 500, 360))
++    sent = [step(ctx, beh, [person(range_m=2.5, bearing=10.0), stranger]) for _ in range(10)]
++    assert sent[-1][1] <= 0
++    ctx2, beh2 = setup(sidestep=False)
++    assert run(ctx2, beh2, 0.7, range_m=2.5, bearing=0.0)[-1][1] == 35  # the user straight ahead: no brake
++
++
++def test_never_backs_into_something_mapped_behind():
++    ctx, beh = setup()
++    ctx.grid.mark_blocked(-0.6, 0.0, 0.2, weight=2.0)
++    _, fb, _, _ = run(ctx, beh, 0.5, range_m=0.4)[-1]  # the person is too close: FollowBehind backs off at -50
++    assert fb == 0 and "obstacle behind" in beh.status
++    ctx2, beh2 = setup()
++    assert run(ctx2, beh2, 0.5, range_m=0.4)[-1][1] == -50  # nothing behind: backs off as before
++
++
++def test_hovering_next_to_something_drifts_away_from_it():
++    ctx, beh = setup()
++    beh.obstacles.append(Obstacle(1e9, 0.0, 0.3, 0.05, math.inf, "potted plant"))  # right next to us on the right
++    lr, fb, _, _ = run(ctx, beh, 0.5, range_m=1.0, bearing=0.0)[-1]  # at the follow distance: hovering
++    assert lr < 0 and "keeping clear of the right" in beh.status
++
++
++def test_kill_switch_is_exactly_follow_behind():
++    cfg = load_config(overrides={"follow": {"avoid": {"enabled": False, "use_map": True}}})
++    a_ctx, b_ctx = (Ctx(cfg, RecDrone(), Perception(cfg)) for _ in range(2))
++    a, b = FollowAvoid(cfg.follow), FollowBehind(cfg.follow)
++    a.start(a_ctx)
++    b.start(b_ctx)
++    for c in (a_ctx, b_ctx):
++        c.grid.mark_blocked(0.9, 0.0, 0.2, weight=2.0)
++    for i in range(40):
++        r, bearing = 2.5 - 0.05 * i, 10.0 - i
++        step(a_ctx, a, [person(r, bearing)], t=i * DT)
++        step(b_ctx, b, [person(r, bearing)], t=i * DT)
++    assert a_ctx.drone.sent == b_ctx.drone.sent and a_ctx.odom.pose.x == 0.0
++
++
++# ------------------------------------------------------------------ occlusion recovery
++def lose_behind_obstacle(ctx, beh, range_m=2.5, texture=1.0):
++    """Braking for something ahead while following; then the person vanishes (hidden by it). texture: how much
++    of the view ahead the looming estimator can measure (0 = a blank wall)."""
++    ctx.grid.mark_blocked(0.9, 0.0, 0.2, weight=2.0)
++    run(ctx, beh, 1.0, range_m=range_m, bearing=0.0)
++    assert "braking" in beh.status
++    ctx.grid = Grid(16.0, 0.25)  # the way toward where they were is clear again (e.g. after the sidestep)
++    return [step(ctx, beh, [], locked=None, looming=LoomingObs(ctx.now + DT, texture=texture)) for _ in range(int(1.5 / DT))]
++
++
++def test_person_hidden_while_braking_creeps_toward_where_they_were():
++    ctx, beh = setup()
++    lr, fb, ud, yaw = lose_behind_obstacle(ctx, beh)[-1]
++    assert fb == load_config().follow.avoid.recover_rc and abs(yaw) <= 2  # straight at their last spot, slowly
++    assert beh.reacquire_wait and "person hidden: creeping" in beh.status
++    assert any(e.startswith("recover:") for _, e in beh.events)
++    lr, fb, ud, yaw = run(ctx, beh, 0.5, range_m=2.0, bearing=0.0)[-1]  # seen again: normal following
++    assert fb == 35 and not beh.reacquire_wait and "hidden" not in beh.status
++    assert any("seen again" in e for _, e in beh.events)
++    ctx2, beh2 = setup()
++    assert lose_behind_obstacle(ctx2, beh2, texture=0.0)[-1][1] == 0  # a blank wall ahead: no creeping into it
++    assert "cannot see ahead" in beh2.status and beh2.reacquire_wait
++
++
++def test_recovery_stops_person_clearance_short_and_is_bounded():
++    ctx, beh = setup()
++    lr, fb, ud, yaw = lose_behind_obstacle(ctx, beh, range_m=1.05)[-1]  # last seen 1.05 m away: already close
++    assert fb == 0 and "facing where they were" in beh.status
++    ctx2, beh2 = setup(recover_max_s=0.5)
++    lose_behind_obstacle(ctx2, beh2)
++    assert not beh2.reacquire_wait and any("gave up" in e for _, e in beh2.events)  # the mission may reacquire
++
++
++def test_no_obstacle_no_recovery_and_kill_switch():
++    ctx, beh = setup()
++    run(ctx, beh, 1.0, range_m=2.5, bearing=5.0)  # following, nothing in the way
++    sent = [step(ctx, beh, [], locked=None) for _ in range(int(1.5 / DT))]
++    assert sent[-1][1] == 0 and sent[-1][3] == load_config().follow.search_yaw_rc  # FollowBehind's own search
++    assert not beh.reacquire_wait and not any(e.startswith("recover") for _, e in beh.events)
++    ctx2, beh2 = setup(recover=False)
++    assert lose_behind_obstacle(ctx2, beh2)[-1][1] == 0 and not beh2.reacquire_wait
++
++
++# ------------------------------------------------------------------ going round, bystanders, ducking
++def test_goes_round_a_seen_obstacle_then_passes_and_drifts_back():
++    ctx, beh = setup()
++    lamp = Obstacle(1e9, 1.3, 0.0, 0.25, 1.85, "floor lamp")  # seen, standing 1.3 m ahead in our way
++    beh.obstacles.append(lamp)
++    sent = run(ctx, beh, 1.0, bearing=-8.0)  # the user is a little to the left
++    assert any(e.startswith("sidestep left: going round the floor lamp") for _, e in beh.events)  # within 0.3 s
++    sent += run(ctx, beh, 6.0, bearing=-8.0)
++    assert any(lr < 0 for lr, *_ in sent) and all(yaw == -4 for *_, yaw in sent)  # yaw stays FollowBehind's
++    assert any("passing the floor lamp" in e for _, e in beh.events)
++    ahead, right = beh._body(ctx, lamp.x, lamp.y)
++    assert abs(right) >= beh._need(lamp) - 0.05  # never cut through its keep-out
++    assert any(fb > 0 for _, fb, _, _ in sent[-30:])  # and on forward past it
++
++
++def test_bystander_keeps_1m_and_is_never_followed():
++    ctx, beh = setup()
++    user, other = person(range_m=2.4, bearing=-35.0, track=1), person(range_m=2.2, bearing=0.0, track=2, box=(460, 280, 500, 360))
++    sent = [step(ctx, beh, [user, other]) for _ in range(int(3.0 / DT))]
++    assert any(lr < 0 for lr, *_ in sent)  # going round on the user's side (left)
++    assert beh.bystanders and 1 not in ctx.perception.not_the_person  # the user is never ruled out
++    # the user's track is lost; the lock (wrongly) jumps to the bystander where they stood: not followed
++    wrong = person(range_m=2.2, bearing=0.0, track=5, box=(460, 280, 500, 360))
++    step(ctx, beh, [wrong])
++    assert 5 in ctx.perception.not_the_person and "bystander" in beh.events[-1][1]
++    assert ctx.drone.sent[-1][3] != 0 or ctx.drone.sent[-1][1] <= 0  # not steering / flying at them
++
++
++def test_ducks_under_a_header_the_user_walked_under_and_climbs_back():
++    import numpy as np
++
++    ctx, beh = setup(duck=True)
++    def loom(t, below=0.05, alt=2.0):  # the header looms at and above the horizon, the doorway below it does not;
++        mid = 0.9 if alt > 1.75 else 0.05  # ducked, the header is above the horizon
++        return LoomingObs(t, rate=0.9, ttc_s=1.1, texture=1.0, dt_s=0.13,
++                          cells=np.array([[0.9, 0.9, 0.9, 0.9], [0.5, mid, mid, 0.5], [0.6, below, below, 0.6]]))
++    run(ctx, beh, 1.0, range_m=1.2, bearing=0.0)  # following; the user is 1.2 m ahead...
++    run(ctx, beh, 1.5, range_m=2.2, bearing=0.0)  # ...and walks on under the header
++    alt = 2.0
++    for i in range(int(7.0 / DT)):
++        ctx.now += DT
++        ctx.tel = Telemetry(ctx.now, yaw_deg=0.0, height_m=alt, tof_m=alt)
++        ctx.new_frame = True
++        res = PerceptionResult(ctx.now, 1000 + i, 0.0, (960, 720), [])
++        p = person(range_m=2.6, bearing=0.0)
++        res.persons, res.person, res.person_unseen_s = [p], p, 0.0
++        res.ran, res.looming = {"person": True}, loom(ctx.now, alt=alt)
++        ctx.res = res
++        beh.step(ctx)
++        lr, fb, ud, yaw = ctx.drone.sent[-1]
++        alt += ud / 100.0 * 0.8 * DT  # the sim's vertical speed at rc 100
++    assert beh.duck is not None and alt < 1.75 and any("duck: overhead" in e for _, e in beh.events)
++    assert "ducked" in beh.status and fb > 0  # under it and on after the user
++    ctx2, beh2 = setup(duck=True)  # the same looming, but something looms straight ahead below the horizon: no duck
++    run(ctx2, beh2, 1.0, range_m=1.2, bearing=0.0)
++    run(ctx2, beh2, 1.5, range_m=2.2, bearing=0.0)
++    for _ in range(10):
++        step(ctx2, beh2, [person(range_m=2.6, bearing=0.0)], looming=loom(ctx2.now + DT, below=0.8))
++    assert beh2.duck is None
++
++
++# ------------------------------------------------------------------ simulator scenarios (sim/follow_scenarios.py)
++def follow_run(name, avoid=True, seconds=45.0, seed=0, duck=False):
++    world, xy, heading = SCENARIOS[name]()
++    cfg = load_config(overrides={"follow": {"avoid": {"enabled": avoid, "duck": duck}}})
++    r = SimRunner(cfg, world=world, drone_xy=xy, drone_heading=heading, seed=seed)
++    r.run(seconds)
++    return r
++
++
++@pytest.mark.slow
++def test_doorway_ducks_under_and_follows_through():
++    r = follow_run("doorway", seconds=40.0, duck=True)
++    assert r.sim.drone.collisions == 0 and min(r.sim.drone.pos[2], 9) < 1.9, r.ctx.notes[-10:]  # ducked, no crash
++
++
++@pytest.mark.slow
++def test_doorway_header_is_a_real_threat_without_avoid():
++    r = follow_run("doorway", avoid=False, seconds=30.0)
++    assert r.sim.drone.collisions > 0  # the header is 3 cm above the follow altitude
++
++
++@pytest.mark.slow
++@pytest.mark.parametrize("name", sorted(SCENARIOS))
++def test_follow_scenarios_without_collisions(name):
++    r = follow_run(name)
++    assert r.sim.drone.collisions == 0, [e for e in r.sim.drone.events if "COLLISION" in e[1]][:3]
++    assert r.mission.state in ("FOLLOW", "REACQUIRE", "HOLD"), r.ctx.notes[-10:]
+diff --git a/tests/test_looming.py b/tests/test_looming.py
+new file mode 100644
+index 0000000..11f4db5
+--- /dev/null
++++ b/tests/test_looming.py
+@@ -0,0 +1,138 @@
++"""follow.avoid step 1: the looming estimator (detect/looming.py) on synthetic frames."""
++
++import time
++
++import cv2
++import numpy as np
++import pytest
++
++from reachglass.config import load_config
++from reachglass.detect import LOOMING, DivergenceLooming, NullLooming
++from reachglass.perception import Perception
++from reachglass.types import Detection, Frame
++
++W, H, FPS = 960, 720, 30.0
++_rng = np.random.default_rng(0)
++TEX = cv2.normalize(cv2.GaussianBlur(_rng.integers(0, 255, (2 * H, 2 * W), dtype=np.uint8), (0, 0), 4), None, 0, 255,
++                    cv2.NORM_MINMAX)
++
++
++def view(scale=1.0, dx=0.0, dy=0.0):
++    """The textured wall seen zoomed by `scale` about the image centre (closer = bigger), shifted by dx, dy px."""
++    M = np.float32([[scale, 0, W / 2 - scale * W + dx], [0, scale, H / 2 - scale * H + dy]])
++    return cv2.cvtColor(cv2.warpAffine(TEX, M, (W, H)), cv2.COLOR_GRAY2BGR)
++
++
++def approach(rate):
++    """Scale at time t when closing on a wall with time-to-contact 1/rate at t=0."""
++    return lambda t: 1.0 / max(1e-3, 1.0 - rate * t)
++
++
++def run(make, n=24, exclude=None, loom=None):
++    loom = loom or DivergenceLooming()
++    obs = [loom.update(make(i / FPS), i / FPS, exclude) for i in range(n)]
++    return obs[-1], obs
++
++
++def test_static_scene_does_not_loom():
++    o, _ = run(lambda t: view())
++    assert o.rate == 0.0 and o.ttc_s is None and o.texture == 1.0
++
++
++def test_approaching_wall_looms_with_its_time_to_contact():
++    s = approach(0.5)  # TTC 2 s at t=0, ~1.3 s at the last frame
++    o, _ = run(lambda t: view(s(t)))
++    assert o.ttc_s is not None and 0.6 < o.ttc_s < 2.0, o.ttc_s
++    assert o.score > 0.3 and abs(o.x_frac - 0.5) < 0.3
++
++
++def test_receding_wall_does_not_loom():
++    o, _ = run(lambda t: view(1.0 / (1.0 + 0.5 * t)))
++    assert o.ttc_s is None and o.rate == 0.0
++    assert np.nanmax(o.cells) < 0.0  # it measured contraction, not nothing
++
++
++def test_sideways_motion_and_turning_do_not_loom():
++    # 3 px/frame at 960 px (~5 deg/s turn or a sideways drift) and a fast 12 px/frame pan
++    for speed in (3.0, 12.0):
++        o, _ = run(lambda t: view(1.0, dx=speed * t * FPS))
++        assert o.ttc_s is None or o.ttc_s > 3.0, (speed, o.ttc_s)
++
++
++def test_expansion_inside_the_locked_person_box_is_ignored():
++    box = (330, 210, 630, 510)  # the person ahead (they are SUPPOSED to be there) grows in the middle of the view
++    s = approach(0.8)
++
++    def frame(t):
++        img = view()
++        patch = view(s(t))
++        img[box[1]:box[3], box[0]:box[2]] = patch[box[1]:box[3], box[0]:box[2]]
++        return img
++
++    looming, _ = run(frame)
++    ignored, _ = run(frame, exclude=[box])
++    assert looming.ttc_s is not None and looming.ttc_s < 2.0  # without the exclusion it would brake...
++    assert ignored.ttc_s is None or ignored.ttc_s > 4.0, ignored.ttc_s  # ...with it, nothing looms
++
++
++def test_blank_wall_is_blind_not_clear():
++    blank = np.full((H, W, 3), 128, np.uint8)
++    o, _ = run(lambda t: blank)
++    assert o.texture == 0.0 and o.ttc_s is None  # nothing measurable: follow_avoid reports "looming blind"
++
++
++def test_gap_or_reset_needs_a_new_baseline():
++    loom = DivergenceLooming()
++    assert loom.update(view(), 0.0).cells is None  # no earlier frame yet
++    loom.update(view(), 0.2)
++    assert loom.update(view(), 5.0).cells is None  # 4.8 s gap: frames are not comparable
++    loom.reset()
++    assert not loom.hist
++
++
++def test_cost_per_frame_is_a_few_ms():
++    loom = DivergenceLooming()
++    s = approach(0.3)
++    imgs = [view(s(i / FPS)) for i in range(20)]
++    t0 = time.perf_counter()
++    for i, img in enumerate(imgs):
++        loom.update(img, i / FPS)
++    per_frame_ms = 1000 * (time.perf_counter() - t0) / len(imgs)
++    assert per_frame_ms < 6.0, per_frame_ms  # ~1 ms on an M-series laptop, 960 x 720 input
++
++
++def test_registry_and_perception_run_it_in_follow_only():
++    cfg = load_config()
++    assert isinstance(LOOMING.build(cfg.perception.looming), DivergenceLooming)
++    assert isinstance(LOOMING.build("null"), NullLooming)
++    per = Perception(cfg)  # built from the config, no model needed
++    per.set_mode("follow")
++    rs = [per.update(Frame(view(approach(0.5)(i / FPS)), i / FPS, i)) for i in range(10)]
++    assert rs[-1].looming is not None and rs[-1].looming.ttc_s is not None
++    per.set_mode("search")
++    assert per.update(Frame(view(), 1.0, 11)).looming is None
++    with pytest.raises(ValueError):  # follow.avoid.looming without the estimator must not fail silently
++        load_config(overrides={"perception": {"looming": {"kind": "null"}}})
++
++
++def test_perception_excludes_the_locked_persons_box():
++    from reachglass.detect import Detector
++
++    class OnePerson(Detector):
++        classes = ["person"]
++
++        def detect(self, image):
++            return [Detection("person", 0.9, (330, 210, 630, 510))]
++
++    box, s = (330, 210, 630, 510), approach(0.8)
++
++    def frame(i):
++        img = view()
++        img[box[1]:box[3], box[0]:box[2]] = view(s(i / FPS))[box[1]:box[3], box[0]:box[2]]
++        return Frame(img, i / FPS, i)
++
++    per = Perception(load_config(), OnePerson(), None, None)
++    per.set_mode("follow")
++    rs = [per.update(frame(i)) for i in range(24)]
++    assert rs[-1].person is not None
++    assert rs[-1].looming.ttc_s is None or rs[-1].looming.ttc_s > 4.0
+diff --git a/tests/test_perception.py b/tests/test_perception.py
+index 3a18ef6..1ed183a 100644
+--- a/tests/test_perception.py
++++ b/tests/test_perception.py
+@@ -57,11 +57,12 @@ def test_mode_strides_decide_which_detectors_run():
+     per.set_mode("follow")
+     for i in range(10):
+         per.update(frame(i))
+-    assert (person.calls, target.calls, context.calls) == (10, 0, 0)
++    # follow: furniture every 5th frame (follow.avoid); the target detector only once a target is set
++    assert (person.calls, target.calls, context.calls) == (10, 0, 2)
+     per.set_mode("search")
+     for i in range(10, 20):
+         r = per.update(frame(i))
+-    assert target.calls == 10 and context.calls == 5 and person.calls == 12
++    assert target.calls == 10 and context.calls == 2 + 5 and person.calls == 12
+     assert set(r.ran) == {"person", "target", "context"}
+     per.set_mode("idle")
+     per.update(frame(21))

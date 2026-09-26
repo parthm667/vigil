@@ -1,0 +1,328 @@
+{
+ "stick": 30,
+ "state_hz": 9.806202429395901,
+ "steps": [
+  {
+   "axis": "yaw",
+   "sign": 1,
+   "dead_time_s": 0.2,
+   "tau_s": 0.02,
+   "gain": 16.79,
+   "unit": "deg/s",
+   "rmse": 0.834,
+   "video_onset_s": 0.389
+  },
+  {
+   "axis": "yaw",
+   "sign": -1,
+   "dead_time_s": 0.12,
+   "tau_s": 0.02,
+   "gain": 17.541,
+   "unit": "deg/s",
+   "rmse": 0.61,
+   "video_onset_s": 0.383
+  },
+  {
+   "axis": "yaw",
+   "sign": 1,
+   "dead_time_s": 0.17,
+   "tau_s": 0.02,
+   "gain": 16.276,
+   "unit": "deg/s",
+   "rmse": 0.606,
+   "video_onset_s": 0.002
+  },
+  {
+   "axis": "yaw",
+   "sign": -1,
+   "dead_time_s": 0.2,
+   "tau_s": 0.02,
+   "gain": 16.984,
+   "unit": "deg/s",
+   "rmse": 0.435,
+   "video_onset_s": 0.397
+  },
+  {
+   "axis": "yaw",
+   "sign": 1,
+   "dead_time_s": 0.18,
+   "tau_s": 0.02,
+   "gain": 16.144,
+   "unit": "deg/s",
+   "rmse": 0.985,
+   "video_onset_s": 0.384
+  },
+  {
+   "axis": "yaw",
+   "sign": -1,
+   "dead_time_s": 0.12,
+   "tau_s": 0.02,
+   "gain": 15.651,
+   "unit": "deg/s",
+   "rmse": 0.183,
+   "video_onset_s": 0.416
+  },
+  {
+   "axis": "throttle",
+   "sign": 1,
+   "dead_time_s": 0.41,
+   "tau_s": 0.02,
+   "gain": 0.1,
+   "unit": "m/s",
+   "rmse": 0.0,
+   "video_onset_s": 0.522
+  },
+  {
+   "axis": "throttle",
+   "sign": -1,
+   "dead_time_s": 0.45,
+   "tau_s": 0.02,
+   "gain": 0.097,
+   "unit": "m/s",
+   "rmse": 0.01,
+   "video_onset_s": 0.751
+  },
+  {
+   "axis": "throttle",
+   "sign": 1,
+   "dead_time_s": 0.4,
+   "tau_s": 0.02,
+   "gain": 0.097,
+   "unit": "m/s",
+   "rmse": 0.011,
+   "video_onset_s": 0.522
+  },
+  {
+   "axis": "throttle",
+   "sign": -1,
+   "dead_time_s": 0.37,
+   "tau_s": 0.02,
+   "gain": 0.097,
+   "unit": "m/s",
+   "rmse": 0.01,
+   "video_onset_s": 0.695
+  },
+  {
+   "axis": "throttle",
+   "sign": 1,
+   "dead_time_s": 0.42,
+   "tau_s": 0.02,
+   "gain": 0.097,
+   "unit": "m/s",
+   "rmse": 0.01,
+   "video_onset_s": 0.505
+  },
+  {
+   "axis": "throttle",
+   "sign": -1,
+   "dead_time_s": 0.38,
+   "tau_s": 0.02,
+   "gain": 0.097,
+   "unit": "m/s",
+   "rmse": 0.01,
+   "video_onset_s": 0.702
+  },
+  {
+   "axis": "pitch",
+   "sign": 1,
+   "dead_time_s": 0.54,
+   "tau_s": 0.39,
+   "gain": 0.268,
+   "unit": "m/s",
+   "rmse": 0.03,
+   "video_onset_s": 0.378
+  },
+  {
+   "axis": "pitch",
+   "sign": -1,
+   "dead_time_s": 0.44,
+   "tau_s": 0.44,
+   "gain": 0.298,
+   "unit": "m/s",
+   "rmse": 0.025,
+   "video_onset_s": 0.797
+  },
+  {
+   "axis": "pitch",
+   "sign": 1,
+   "dead_time_s": 0.52,
+   "tau_s": 0.43,
+   "gain": 0.279,
+   "unit": "m/s",
+   "rmse": 0.031,
+   "video_onset_s": 1.231
+  },
+  {
+   "axis": "pitch",
+   "sign": -1,
+   "dead_time_s": 0.47,
+   "tau_s": 0.47,
+   "gain": 0.3,
+   "unit": "m/s",
+   "rmse": 0.027,
+   "video_onset_s": 1.38
+  },
+  {
+   "axis": "pitch",
+   "sign": 1,
+   "dead_time_s": 0.45,
+   "tau_s": 0.45,
+   "gain": 0.271,
+   "unit": "m/s",
+   "rmse": 0.032,
+   "video_onset_s": 1.111
+  },
+  {
+   "axis": "pitch",
+   "sign": -1,
+   "dead_time_s": 0.45,
+   "tau_s": 0.47,
+   "gain": 0.296,
+   "unit": "m/s",
+   "rmse": 0.03,
+   "video_onset_s": 1.302
+  },
+  {
+   "axis": "roll",
+   "sign": 1,
+   "dead_time_s": 0.53,
+   "tau_s": 0.4,
+   "gain": 0.286,
+   "unit": "m/s",
+   "rmse": 0.03,
+   "video_onset_s": 0.872
+  },
+  {
+   "axis": "roll",
+   "sign": -1,
+   "dead_time_s": 0.53,
+   "tau_s": 0.41,
+   "gain": 0.291,
+   "unit": "m/s",
+   "rmse": 0.031,
+   "video_onset_s": 0.404
+  },
+  {
+   "axis": "roll",
+   "sign": 1,
+   "dead_time_s": 0.44,
+   "tau_s": 0.48,
+   "gain": 0.302,
+   "unit": "m/s",
+   "rmse": 0.031,
+   "video_onset_s": 0.816
+  },
+  {
+   "axis": "roll",
+   "sign": -1,
+   "dead_time_s": 0.44,
+   "tau_s": 0.5,
+   "gain": 0.3,
+   "unit": "m/s",
+   "rmse": 0.03,
+   "video_onset_s": 0.831
+  },
+  {
+   "axis": "roll",
+   "sign": 1,
+   "dead_time_s": 0.47,
+   "tau_s": 0.43,
+   "gain": 0.291,
+   "unit": "m/s",
+   "rmse": 0.028,
+   "video_onset_s": 0.734
+  },
+  {
+   "axis": "roll",
+   "sign": -1,
+   "dead_time_s": 0.54,
+   "tau_s": 0.41,
+   "gain": 0.286,
+   "unit": "m/s",
+   "rmse": 0.027,
+   "video_onset_s": 0.873
+  }
+ ],
+ "summary": {
+  "yaw": {
+   "dead_time_s": [
+    0.175,
+    0.12,
+    0.2
+   ],
+   "tau_s": [
+    0.02,
+    0.02,
+    0.02
+   ],
+   "gain_at_stick": [
+    16.533,
+    15.651,
+    17.541
+   ],
+   "gain_per_100_stick": 55.11,
+   "unit": "deg/s",
+   "video_onset_s_median": 0.387
+  },
+  "pitch": {
+   "dead_time_s": [
+    0.46,
+    0.44,
+    0.54
+   ],
+   "tau_s": [
+    0.445,
+    0.39,
+    0.47
+   ],
+   "gain_at_stick": [
+    0.287,
+    0.268,
+    0.3
+   ],
+   "gain_per_100_stick": 0.958,
+   "unit": "m/s",
+   "video_onset_s_median": 1.171
+  },
+  "roll": {
+   "dead_time_s": [
+    0.5,
+    0.44,
+    0.54
+   ],
+   "tau_s": [
+    0.42,
+    0.4,
+    0.5
+   ],
+   "gain_at_stick": [
+    0.291,
+    0.286,
+    0.302
+   ],
+   "gain_per_100_stick": 0.97,
+   "unit": "m/s",
+   "video_onset_s_median": 0.823
+  },
+  "throttle": {
+   "dead_time_s": [
+    0.405,
+    0.37,
+    0.45
+   ],
+   "tau_s": [
+    0.02,
+    0.02,
+    0.02
+   ],
+   "gain_at_stick": [
+    0.097,
+    0.097,
+    0.1
+   ],
+   "gain_per_100_stick": 0.323,
+   "unit": "m/s",
+   "video_onset_s_median": 0.609
+  }
+ }
+}
