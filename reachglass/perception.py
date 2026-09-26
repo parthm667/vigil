@@ -134,6 +134,11 @@ class Perception:
         rng, src = self.object_range(det, cam)
         return ObjectObs(det, cam.bearing_deg(det.cx), cam.elevation_deg(det.cy, pitch, det.cx), rng, src)
 
+    @staticmethod
+    def _touches_border(det: Detection, width: int, height: int, margin_px: float = 2.0) -> bool:
+        x1, y1, x2, y2 = det.bbox
+        return x1 <= margin_px or y1 <= margin_px or x2 >= width - margin_px or y2 >= height - margin_px
+
     def _inside_person(self, det: Detection, persons: list[tuple[float, float, float, float]]) -> bool:
         """Mostly (>= 50 %) inside a person's box: e.g. blue jeans must not pass as the blue dummy."""
         for p in persons:
@@ -143,13 +148,24 @@ class Perception:
                 return True
         return False
 
-    def _run(self, role: str) -> bool:
+    def _stride(self, role: str) -> int:
+        """Run this detector every Nth frame in the current mode (0 = never)."""
         if self.detectors[role] is None:
-            return False
-        stride = self.cfg.perception.stride.get(self.mode, {}).get(role, 0)
+            return 0
+        strides = self.cfg.perception.stride.get(self.mode, {})
+        stride = strides.get(role, 0)
         if self.mode in ("search", "approach") and role == self.owner_of(self.target_cls):
-            stride = 1  # whoever reports the target runs every frame (e.g. the context detector for "chair")
+            # whoever reports the target runs at least at the target's rate (e.g. the context detector for "chair")
+            stride = min(v for v in (stride, strides.get("target", 1)) if v) if (stride or strides.get("target")) else 1
+        return stride
+
+    def _run(self, role: str) -> bool:
+        stride = self._stride(role)
         return bool(stride) and self._mode_i % stride == 0
+
+    def active_roles(self) -> set[str]:
+        """Detector roles that run in the current mode (each at its own stride)."""
+        return {r for r in ("person", "target", "context") if self._stride(r)}
 
     # ------------------------------------------------------------------ main
     def update(self, frame: Frame, telemetry: Telemetry | None = None) -> PerceptionResult:
@@ -173,6 +189,11 @@ class Perception:
                     self._person_boxes_t = frame.t
                 if role == "context":  # the person/target detectors own those classes
                     found = [d for d in found if d.cls != "person"]
+                if role == "target":
+                    # cut by the frame edge: cannot be sized or shape-checked, and a slice of someone's blue
+                    # jeans at the edge is exactly what the person detector misses. A real target gets
+                    # picked up a moment later, once the drone turns toward it.
+                    found = [d for d in found if not self._touches_border(d, frame.width, frame.height)]
                 if role == "target" and frame.t - self._person_boxes_t < 1.5:
                     # people from the latest person-detector run (it runs only every Nth frame)
                     found = [d for d in found if not self._inside_person(d, self._person_boxes)]
@@ -183,11 +204,13 @@ class Perception:
         persons = [d for d in dets if d.cls == "person"]
         res.persons = [self.estimator.estimate(d, cam, altitude, pitch) for d in persons]
         if ran["person"] or persons:
-            ps = self.person_lock.update(dets, frame.t, (frame.width, frame.height))
+            ps = self.person_lock.update(dets, frame.t, (frame.width, frame.height), ran=ran["person"])
             if ps.det is not None:
                 res.person = next((p for p in res.persons if p.det.track_id == ps.det.track_id), None)
+        owner = self.owner_of(self.target_cls) or "target"
+        res.target_ran = ran.get(owner, False) or self.detectors.get(owner) is None
         if self.target_cls:
-            ts = self.target_lock.update(dets, frame.t, (frame.width, frame.height))
+            ts = self.target_lock.update(dets, frame.t, (frame.width, frame.height), ran=ran.get(owner, False))
             for d in dets:
                 if d.cls == self.target_cls:
                     o = self._object_obs(d, cam, pitch)

@@ -2,13 +2,15 @@
 
 observe(ctx)      one fresh perception result -> semantic memory + grid (coverage, free, blocked)
 Scan              rotate in scan_step_deg increments through 360 deg; after each rotation wait dwell_s
-                  (video lag + settling), then observe frames_per_dwell frames. Stops early on a confirmed target.
+                  (video lag + settling), then observe until the target detector (which skips frames) has
+                  looked at frames_per_dwell of them and every other detector at one (people are seen before
+                  a hop is chosen). Stops early on a confirmed target.
 choose_hop(ctx)   score every 15 deg:  score = open x (0.3 + novelty) x semantic x people x not_revisited
                     open      free distance proven along the direction (grid), / hop_max
                     novelty   fraction of never-seen cells in that direction (within view_range)
                     semantic  1 + 2 x sum of prior weights of objects that way (bottles live on tables...)
                               + 4 if an unconfirmed target candidate lies that way
-                    people    0 toward a person closer than person_clearance
+                    people    0 toward a person closer than person_clearance, or where the wearer stood
                     revisit   0.2 if the hop would end within 0.8 m of a previous vantage point
 Hop               rotate to the chosen heading, move forward
 Explore           scan -> (target confirmed? done) -> choose -> hop -> scan ... within the budgets
@@ -57,11 +59,14 @@ def observe(ctx: Ctx, mark_view: bool = True) -> None:
         g.mark_blocked(x, y, FOOTPRINT.get(o.cls, 0.3), top_m=top)
         g.mark_free_ray(pose.x, pose.y, pose.heading_deg + o.bearing_deg, o.range_m - FOOTPRINT.get(o.cls, 0.3) - 0.2)
     for p in res.persons:
-        if p.range_m is None:
+        # close up, head and feet are cut off and no distance cue works: use the conservative lower bound
+        # (closer than they are) rather than forgetting the person who matters most
+        r = p.range_m if p.range_m is not None else p.range_lo_m
+        if r is None:
             continue
-        x, y = pose.point_at(p.range_m, p.bearing_deg)
-        ctx.memory.add("person", x, y, p.det.conf, p.range_m, ctx.now, ctx.vantage)
-        g.mark_free_ray(pose.x, pose.y, pose.heading_deg + p.bearing_deg, p.range_m - 0.7)
+        x, y = pose.point_at(r, p.bearing_deg)
+        ctx.memory.add("person", x, y, p.det.conf, r, ctx.now, ctx.vantage)
+        g.mark_free_ray(pose.x, pose.y, pose.heading_deg + p.bearing_deg, r - 0.7)
     if mark_view and ctx.frame is not None:
         cam = ctx.perception.camera.for_frame(ctx.frame.width, ctx.frame.height)
         free = None
@@ -88,6 +93,7 @@ class Scan(Behavior):
         self.phase = "dwell"
         self.dwell_start = ctx.now
         self.frames = 0
+        self.looked: set[str] = set()  # detector roles that have looked at this view
         self.cmd: Discrete | None = None
         self.found = False
         ctx.vantages.append((ctx.odom.pose.x, ctx.odom.pose.y))
@@ -100,20 +106,23 @@ class Scan(Behavior):
             if r == FAILURE:
                 self.status = f"rotation failed: {self.cmd.result}"
                 return FAILURE
-            self.phase, self.dwell_start, self.frames = "dwell", ctx.now, 0
+            self.phase, self.dwell_start, self.frames, self.looked = "dwell", ctx.now, 0, set()
             return RUNNING
         ctx.drone.rc(0, 0, 0, 0)  # keep-alive while looking
         if ctx.now - self.dwell_start < self.c.dwell_s:
             return RUNNING
         if ctx.new_frame and ctx.frame_after_cmd():  # a frame that really shows the new heading
             observe(ctx)
-            self.frames += 1
+            self.frames += ctx.res is not None and ctx.res.target_ran  # count the frames the target detector saw
+            if ctx.res is not None:
+                self.looked |= {role for role, ran in ctx.res.ran.items() if ran}
             t = ctx.res.target if ctx.res else None
             if self.stop_on_target and t is not None and t.confirmed:
                 self.found = True
                 self.status = f"target confirmed at {t.range_m or float('nan'):.1f} m, bearing {t.bearing_deg:+.0f}"
                 return SUCCESS
-        if self.frames >= self.c.frames_per_dwell:
+        everyone = ctx.perception.active_roles() <= self.looked  # e.g. the person detector runs every 5th frame
+        if (self.frames >= self.c.frames_per_dwell and everyone) or ctx.now - self.dwell_start > self.c.dwell_s + 3.0:
             self.steps_done += 1
             if self.steps_done >= self.n_steps:
                 self.status = "scan complete, target not confirmed"
@@ -143,6 +152,11 @@ def choose_hop(ctx: Ctx) -> tuple[float, float, dict] | None:
         # view range of HERE, so novelty is measured beyond the hop's end point)
         novelty = ctx.grid.novelty(Pose2D(end[0], end[1], h), h, c.view_range_m)
         sem, cand, people = 1.0, 0.0, 1.0
+        if ctx.person_origin is not None:  # the wearer usually waits where they asked, seen or not
+            ox, oy = ctx.person_origin
+            d = pose.distance_to(ox, oy)
+            if d < c.person_clearance_m + dist and angdiff(math.degrees(math.atan2(oy - pose.y, ox - pose.x)), h) < 30:
+                people = 0.0
         for o in objs:
             ox, oy = o.xy
             d = pose.distance_to(ox, oy)

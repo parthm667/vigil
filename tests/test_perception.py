@@ -59,13 +59,13 @@ def test_mode_strides_decide_which_detectors_run():
         per.update(frame(i))
     assert (person.calls, target.calls, context.calls) == (10, 0, 0)
     per.set_mode("search")
-    for i in range(10, 20):
-        r = per.update(frame(i))
-    assert target.calls == 10 and context.calls == 5 and person.calls == 12
-    assert set(r.ran) == {"person", "target", "context"}
+    rs = [per.update(frame(i)) for i in range(10, 20)]
+    assert target.calls == 4 and context.calls == 5 and person.calls == 12  # target every 3rd frame (0,3,6,9)
+    assert set(rs[-1].ran) == {"person", "target", "context"}
+    assert [r.target_ran for r in rs] == [i % 3 == 0 for i in range(10)]
     per.set_mode("idle")
     per.update(frame(21))
-    assert target.calls == 10
+    assert target.calls == 4
     with pytest.raises(ValueError):
         per.set_mode("dance")
 
@@ -82,11 +82,12 @@ def test_target_obs_range_bearing_and_confirmation():
     per = Perception(cfg, None, Scripted(["bottle"], lambda i: [bottle_box(2.5, 12.0)]), None)
     per.set_mode("approach")
     per.set_target("bottle")
-    rs = [per.update(frame(i)) for i in range(4)]
+    rs = [per.update(frame(i)) for i in range(5)]  # approaching: the target detector looks at every 2nd frame
     t = rs[-1].target
     assert t is not None and t.range_m == pytest.approx(2.5, rel=0.02) and t.bearing_deg == pytest.approx(12.0, abs=0.2)
-    assert [r.target.confirmed for r in rs] == [True, True, True, True]  # conf 0.7 >= 0.55 and plausible -> 1st frame
-    assert rs[-1].target_unseen_s == 0.0
+    # conf 0.7 >= confirm_conf and plausible -> confirmed on its first sighting
+    assert [r.target is not None and r.target.confirmed for r in rs] == [True, False, True, False, True]
+    assert rs[-1].target_unseen_s == 0.0 and rs[-2].target_unseen_s == pytest.approx(0.1)
 
 
 def test_partly_hidden_round_target_ranges_from_its_width():
@@ -104,13 +105,16 @@ def test_partly_hidden_round_target_ranges_from_its_width():
 
 
 def test_implausible_single_detection_needs_repeats():
-    cfg = load_config()
+    # the detector looks at every 3rd frame: 3 hits within its last 5 RUNS confirm (5 camera frames never hold 3)
+    cfg = load_config(overrides={"perception": {"stride": {"approach": {"target": 3}}}})
     far = bottle_box(12.0)  # a "bottle" 12 m away: implausible in a room -> no single-frame confirmation
     per = Perception(cfg, None, Scripted(["bottle"], lambda i: [far]), None)
     per.set_mode("approach")
     per.set_target("bottle")
-    rs = [per.update(frame(i)) for i in range(4)]
-    assert [r.target.confirmed for r in rs] == [False, False, True, True]
+    rs = [per.update(frame(i)) for i in range(8)]
+    assert [r.target_ran for r in rs] == [True, False, False, True, False, False, True, False]
+    assert [r.target is not None and r.target.confirmed for r in rs] == [False] * 6 + [True, False]
+    assert rs[7].target_unseen_s == pytest.approx(0.1)  # a frame it did not look at is not "lost"
 
 
 def test_target_from_context_detector_when_asked_for_furniture():
@@ -119,9 +123,9 @@ def test_target_from_context_detector_when_asked_for_furniture():
     per.set_mode("search")
     per.set_target("chair")
     rs = [per.update(frame(i)) for i in range(4)]
-    # the context detector owns "chair", so while searching for a chair it runs every frame
-    assert [r.ran["context"] for r in rs] == [True, True, True, True]
-    assert rs[3].target is not None and rs[3].target.cls == "chair" and rs[3].context == []
+    # the context detector owns "chair", so while searching for a chair it runs at least at the target's rate
+    assert [r.ran["context"] for r in rs] == [True, False, True, False] and [r.target_ran for r in rs] == [True, False, True, False]
+    assert rs[2].target is not None and rs[2].target.cls == "chair" and rs[2].context == []
     per.set_target("bottle")  # back to a target the target detector owns: context detector at its stride
     rs = [per.update(frame(i)) for i in range(4, 8)]
     assert [r.ran["context"] for r in rs] == [True, False, True, False]
@@ -176,7 +180,7 @@ def test_red_shirt_inside_a_person_is_not_the_target():
     per = Perception(load_config(), Scripted(["person"], lambda i: [person]), Scripted(["bottle"], lambda i: [shirt, real]), None)
     per.set_mode("search")
     per.set_target("bottle")
-    rs = [per.update(frame(i)) for i in range(6)]  # person detector runs only every 5th frame in search
+    rs = [per.update(frame(i)) for i in range(7)]  # search: person detector every 5th frame, target every 3rd
     for r in rs:
         assert all(abs(t.bearing_deg + 20.0) < 1.0 for t in r.targets), [t.bearing_deg for t in r.targets]
     assert rs[-1].target is not None and rs[-1].target.bearing_deg == pytest.approx(-20.0, abs=0.5)
@@ -184,7 +188,8 @@ def test_red_shirt_inside_a_person_is_not_the_target():
 
 def test_from_config_builds_default_detectors():
     per = Perception.from_config(load_config(overrides={"perception": {"person_detector": {"kind": ""},
-                                                                        "context_detector": {"kind": ""}}}))
+                                                                        "context_detector": {"kind": ""}}},
+                                             target="color"))
     assert per.detectors["person"] is None and isinstance(per.detectors["target"], ColorBlobDetector)
     assert per.vocabulary() == ["bottle"]
 

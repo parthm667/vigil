@@ -25,11 +25,22 @@ WIN = "HSV picker (click the object; c = clear clicks; p = print config; q = qui
 BARS = [("H lo", 100, 180), ("H hi", 122, 180), ("S lo", 100, 255), ("S hi", 255, 255), ("V lo", 70, 255), ("V hi", 255, 255)]
 
 
-def ranges_from_bars() -> list[list[int]]:
-    h0, h1, s0, s1, v0, v1 = (cv2.getTrackbarPos(n, WIN) for n, _, _ in BARS)
+def range_from_bar_values(vals) -> list[int]:
+    """Slider values (BARS order: H lo, H hi, S lo, S hi, V lo, V hi) -> config order [h0, s0, v0, h1, s1, v1]."""
+    h0, h1, s0, s1, v0, v1 = (int(v) for v in vals)
     s0, s1 = min(s0, s1), max(s0, s1)
     v0, v1 = min(v0, v1), max(v0, v1)
-    return [[h0, s0, v0, h1, s1, v1]]  # h0 > h1 means wrap-around (red): the detector splits it
+    return [h0, s0, v0, h1, s1, v1]  # h0 > h1 means wrap-around (red): the detector splits it
+
+
+def bar_values_from_range(r) -> list[int]:
+    """Config order [h0, s0, v0, h1, s1, v1] -> slider values in BARS order."""
+    h0, s0, v0, h1, s1, v1 = r
+    return [h0, h1, s0, s1, v0, v1]
+
+
+def ranges_from_bars() -> list[list[int]]:
+    return [range_from_bar_values(cv2.getTrackbarPos(n, WIN) for n, _, _ in BARS)]
 
 
 def range_from_samples(samples: list[tuple[int, int, int]], h_margin: int = 8, s_margin: int = 70,
@@ -69,7 +80,7 @@ def main(argv=None) -> int:
         h, s, v = (int(np.median(patch[:, k])) for k in range(3))
         state["clicks"].append((h, s, v))
         print(f"clicked HSV = ({h}, {s}, {v})  [{len(state['clicks'])} click(s) in the range]")
-        for (name, _, _), val in zip(BARS, range_from_samples(state["clicks"])):
+        for (name, _, _), val in zip(BARS, bar_values_from_range(range_from_samples(state["clicks"]))):
             cv2.setTrackbarPos(name, WIN, int(val))
 
     cv2.setMouseCallback(WIN, on_click)

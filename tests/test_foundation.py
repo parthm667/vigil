@@ -146,7 +146,7 @@ def test_scaled_camera_keeps_angles():
 # ------------------------------------------------------------------ config
 def test_config_defaults_and_overrides(tmp_path):
     cfg = load_config()
-    assert cfg.follow.distance_m == 1.0 and cfg.follow.altitude_m == 2.0 and cfg.perception.target_detector.kind == "color_blob"
+    assert cfg.follow.distance_m == 1.0 and cfg.follow.altitude_m == 2.0 and cfg.perception.target_detector.kind == "yolo"
     cfg = load_config(overrides={"follow": {"distance_m": 2, "altitude_m": 2.2}})
     assert cfg.follow.distance_m == 2.0 and isinstance(cfg.follow.distance_m, float)
     # dict fields merge
@@ -168,7 +168,7 @@ def test_config_unknown_key_fails_loudly():
 
 
 def test_component_params_replace_on_kind_change_merge_otherwise():
-    cfg = load_config(overrides={"perception": {"target_detector": {"params": {"label": "cup"}}}})
+    cfg = load_config(overrides={"perception": {"target_detector": {"params": {"label": "cup"}}}}, target="color")
     p = cfg.perception.target_detector.params
     assert p["label"] == "cup" and "hsv_ranges" in p  # same kind: merged
     cfg = load_config(overrides={"perception": {"target_detector": {"kind": "yolo", "params": {"weights": "bottle.pt"}}}})
@@ -179,4 +179,16 @@ def test_component_params_replace_on_kind_change_merge_otherwise():
 def test_configs_are_independent():
     a, b = load_config(), load_config()
     a.perception.object_heights_m["bottle"] = 9
-    assert b.perception.object_heights_m["bottle"] == 0.19
+    assert b.perception.object_heights_m["bottle"] == 0.24
+
+
+def test_target_presets_switch_detector_sizes_and_confirmation_together():
+    yw, col = load_config(), load_config(target="color")
+    assert yw.perception.target_detector.kind == "yolo" and yw.perception.object_heights_m["bottle"] == 0.24
+    assert col.perception.target_detector.kind == "color_blob" and col.perception.object_heights_m["bottle"] == 0.19
+    assert "prompts" not in col.perception.target_detector.params  # a kind change replaces the params
+    assert yw.tracking.confirm_conf < col.tracking.confirm_conf  # YOLO-World scores lower than the colour blob
+    back = load_config(overrides={"perception": {"target_detector": {"kind": "color_blob"}}}, target="yolo-world")
+    assert back.perception.target_detector.kind == "color_blob"  # explicit overrides still win
+    with pytest.raises(ValueError, match="color"):
+        load_config(target="colour")

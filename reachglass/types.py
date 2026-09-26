@@ -188,5 +188,8 @@ class PerceptionResult:
     target: TargetObs | None = None  # the locked target object
     context: list[ObjectObs] = field(default_factory=list)  # other objects (furniture...) for exploration
     ran: dict = field(default_factory=dict)  # role -> did that detector run on this frame
+    # did the detector that reports the target run on this frame? (it skips frames; "no target" on a frame it
+    # did not look at means nothing. True when there is no such detector: nothing to wait for)
+    target_ran: bool = True
     person_unseen_s: float = float("inf")  # time since the locked person was last seen
     target_unseen_s: float = float("inf")

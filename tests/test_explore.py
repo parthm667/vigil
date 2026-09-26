@@ -69,6 +69,8 @@ def test_scan_from_a_spot_that_sees_the_target_confirms_it():
 def test_scan_without_target_in_view_covers_360_and_fills_memory():
     sim, ctx = setup(start=(1.0, 1.0), heading=0.0, target=(6.2, 5.0))
     sim.world.boxes = [b for b in sim.world.boxes if b.cls != "bottle"]  # no target at all
+    # coverage test: the table is in exactly one view, where the (seeded) 5 % detector dropout can hit both looks
+    sim.context_detector.dropout = 0.0
     scan = Scan(ctx.cfg.explore)
     r, dt = run(sim, ctx, scan, 120)
     assert r == SUCCESS and not scan.found

@@ -5,32 +5,26 @@ drone: {video_lag_s: 0.25}              # step 1: latency test 2026-09-26
 
 camera: {fx: 1077, fy: 1077}            # step 2: median fx/fy from calibrate_camera (1.5 / 2 / 3 m)
 
+
 perception:
   pitch_sign: 1                       # step 1: only if forward acceleration gives NEGATIVE pitch
 
-  # --- the dummy: the team's blue water bottle (24 cm tall, 9 cm wide, black cap), found by COLOUR (~2 ms/frame)
-  target_detector:
-    kind: color_blob
-    params:
-      label: bottle
-      # measured from a photo (hue 108-114, sat ~165, brightness 85-230); step 3: re-check with hsv_picker
-      # under the room's lights and paste its line here
-      hsv_ranges: [[100, 100, 70, 122, 255, 255]]
-  object_heights_m: {bottle: 0.19}      # the BLUE part only: the colour detector does not see the cap / steel ring
-  object_widths_m: {bottle: 0.09}
-
-  # --- alternative: YOLO-World told "blue water bottle" (0.94 confidence on the photo; boxes the WHOLE bottle).
-  # ~16 ms/frame on a Mac GPU but ~180+ ms on a laptop CPU: time it on the demo laptop before switching.
-  # To use it, comment out the colour block above and uncomment:
+  # --- the bottle: found by YOLO-World by default ("blue water bottle" / "hydro flask water bottle", 960 px,
+  # every 3rd frame while searching, plus a blue check on each box so another bottle is not taken for it).
+  # Nothing to set here: the preset lives in reachglass/config.py (TARGET_PRESETS["yolo-world"]).
+  # Check it live on the Tello:  python -m reachglass.tools.target_view tello --config site.yaml
+  #
+  # Back to the colour dummy for one run:  python -m reachglass tello --config site.yaml --target color
+  # Or for good, uncomment (the colour blob sees only the blue body, 0.19 m, not the cap):
   # target_detector:
-  #   kind: yolo
-  #   params: {weights: yolov8s-worldv2.pt, prompts: [blue water bottle], rename: {blue water bottle: bottle},
-  #            classes: [bottle], conf: 0.25, imgsz: 640}
-  # object_heights_m: {bottle: 0.24}
+  #   kind: color_blob
+  #   params: {label: bottle, hsv_ranges: [[100, 100, 70, 122, 255, 255]]}   # found the bottle live on the Tello feed
+  # object_heights_m: {bottle: 0.19}
   # object_widths_m: {bottle: 0.09}
+  # tracking: {confirm_conf: 0.55}      (top level, not under perception)
 
-  # person_height_m: 1.78               # step 4: wearer's real height WITH SHOES, to +-2 cm
-  # person_height_sd_m: 0.02
+  person_height_m: 1.70              # step 4: wearer's real height WITH SHOES, to +-2 cm
+  person_height_sd_m: 0.02
 
-# follow: {altitude_m: 2.0, distance_m: 1.0}    # defaults; altitude_m >= wearer height + 0.2
-# safety: {max_altitude_m: 2.3}                 # keep below your ceiling
+follow: {altitude_m: 1.9, distance_m: 1.0}    # defaults; altitude_m >= wearer height + 0.2
+safety: {max_altitude_m: 2.3}                 # keep below your ceiling

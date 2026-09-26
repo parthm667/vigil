@@ -83,8 +83,9 @@ def test_color_blob_in_real_photos_and_dim_light(assets):
 
 
 def test_registry_builds_configured_target_detector():
-    cfg = load_config()
-    det = DETECTORS.build(cfg.perception.target_detector)
+    spec = load_config().perception.target_detector  # default: YOLO-World (built in the yolo tests below)
+    assert spec.kind == "yolo" and "blue water bottle" in spec.params["prompts"] and spec.params["classes"] == ["bottle"]
+    det = DETECTORS.build(load_config(target="color").perception.target_detector)
     assert isinstance(det, ColorBlobDetector) and det.classes == ["bottle"]
     assert isinstance(DETECTORS.build("null"), NullDetector) and DETECTORS.build("null").detect(scene()) == []
     assert DETECTORS.build(ComponentSpec("", {})) is None
@@ -151,3 +152,33 @@ def test_hsv_picker_range_covers_every_click_including_red_wraparound():
     ColorBlobDetector(hsv_ranges=[r])  # valid for the detector
     g = range_from_samples([(60, 200, 200), (70, 150, 150)])
     assert g[0] < g[3] and covered(g, 65, 160, 160) and not covered(g, 0, 200, 200)
+
+
+def test_hsv_picker_sliders_get_the_clicked_range_in_their_own_order():
+    """Regression: the click range was written onto the sliders in config order, so V lo became 255 and the
+    mask went empty as soon as you clicked."""
+    from reachglass.tools.hsv_picker import BARS, bar_values_from_range, range_from_bar_values, range_from_samples
+
+    r = range_from_samples([(111, 179, 130)])  # the blue bottle, as clicked on the Tello feed
+    bars = bar_values_from_range(r)
+    assert dict(zip((n for n, _, _ in BARS), bars)) == {"H lo": 103, "H hi": 119, "S lo": 109, "S hi": 255,
+                                                         "V lo": 60, "V hi": 255}
+    assert range_from_bar_values(bars) == r
+
+
+@pytest.mark.yolo
+def test_yolo_world_finds_the_team_bottle_and_only_a_blue_one():
+    """The default target detector on the team's own photos (960x720 like the Tello): found with a confident
+    box; the same scene with the bottle turned red is rejected by the blue check."""
+    from pathlib import Path
+
+    det = DETECTORS.build(load_config().perception.target_detector)
+    for f in sorted((Path(__file__).parent / "assets" / "bottle").glob("*.jpg")):
+        img = cv2.imread(str(f))
+        found = det.detect(img)
+        assert len(found) == 1 and found[0].cls == "bottle" and found[0].conf >= 0.5, (f.name, found)
+        x1, y1, x2, y2 = found[0].bbox
+        assert 1.8 < (y2 - y1) / (x2 - x1) < 3.3, f.name  # the whole bottle, cap included (24 x 9 cm)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        hsv[..., 0] = (hsv[..., 0].astype(int) - 110) % 180  # blue -> red, everything else shifts too
+        assert det.detect(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)) == [], f.name

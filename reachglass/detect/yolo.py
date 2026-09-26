@@ -9,6 +9,9 @@ Bare weight names are resolved into <repo>/models/ (downloaded there on first us
 `prompts` (YOLO-World weights only) sets the open-vocabulary text classes, e.g.
     UltralyticsDetector(weights="yolov8s-worldv2.pt", prompts=["blue water bottle"],
                         rename={"blue water bottle": "bottle"}, classes=["bottle"])
+`agnostic_nms` merges overlapping boxes across classes (several prompts for the same object).
+`require_color` = {"hsv_ranges": [[...]], "min_frac": 0.3} keeps only boxes whose middle is mostly that
+colour: YOLO-World finds bottles, this keeps the team's BLUE one (a red or clear bottle is dropped).
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import numpy as np
 
 from ..types import Detection
 from .base import Detector
+from .color_blob import hsv_mask, parse_hsv_ranges
 
 MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 
@@ -49,7 +53,8 @@ class UltralyticsDetector(Detector):
 
     def __init__(self, weights: str = "yolo11n.pt", classes: list[str] | None = None, conf: float = 0.35,
                  imgsz: int = 640, device: str = "auto", rename: dict | None = None, iou: float = 0.5,
-                 max_det: int = 50, half: bool = False, warmup: bool = True, prompts: list[str] | None = None):
+                 max_det: int = 50, half: bool = False, warmup: bool = True, prompts: list[str] | None = None,
+                 agnostic_nms: bool = False, require_color: dict | None = None):
         from ultralytics import YOLO
 
         self.weights = resolve_weights(weights)
@@ -74,6 +79,11 @@ class UltralyticsDetector(Detector):
         self._kwargs = dict(conf=conf, iou=iou, imgsz=imgsz, classes=self._ids, device=self.device, max_det=max_det, verbose=False)
         if half:  # passing half=False makes ultralytics 8.4 print a deprecation line on every call
             self._kwargs["half"] = True
+        if agnostic_nms:
+            self._kwargs["agnostic_nms"] = True
+        self._color = None
+        if require_color:
+            self._color = (parse_hsv_ranges(require_color["hsv_ranges"]), float(require_color.get("min_frac", 0.3)))
         if warmup:  # pay model load / first-inference latency now, not in flight
             self.model.predict(np.zeros((imgsz, imgsz, 3), np.uint8), **self._kwargs)
 
@@ -95,6 +105,20 @@ class UltralyticsDetector(Detector):
         out = []
         for i in range(len(xyxy)):
             k = None if kps is None else kps[i].astype(np.float32)
-            out.append(Detection(self._all[int(cls[i])], float(confs[i]), tuple(float(v) for v in xyxy[i]), k, source=self.name))
+            box = tuple(float(v) for v in xyxy[i])
+            if self._color is not None and self.color_frac(image, box) < self._color[1]:
+                continue
+            out.append(Detection(self._all[int(cls[i])], float(confs[i]), box, k, source=self.name))
         out.sort(key=lambda d: -d.conf)
         return out
+
+    def color_frac(self, image: np.ndarray, box) -> float:
+        """Fraction of the box's middle 60 % (width) in the required colour: the sides of a round bottle's box
+        are background."""
+        x1, y1, x2, y2 = box
+        w = x2 - x1
+        xa, xb = int(max(0, x1 + 0.2 * w)), int(min(image.shape[1], x2 - 0.2 * w))
+        ya, yb = int(max(0, y1)), int(min(image.shape[0], y2))
+        if xb <= xa or yb <= ya:
+            return 0.0
+        return float(np.count_nonzero(hsv_mask(image[ya:yb, xa:xb], self._color[0]))) / ((xb - xa) * (yb - ya))

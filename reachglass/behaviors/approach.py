@@ -34,8 +34,9 @@ def recent_people(ctx: Ctx, max_age_s: float = 15.0) -> list[tuple[float, float]
     pose = ctx.odom.pose
     if ctx.res is not None:
         for p in ctx.res.persons:
-            if p.range_m is not None:
-                pts.append(pose.point_at(p.range_m, p.bearing_deg))
+            r = p.range_m if p.range_m is not None else p.range_lo_m  # too close to measure: the lower bound
+            if r is not None:
+                pts.append(pose.point_at(r, p.bearing_deg))
     for o in ctx.memory.of_class("person"):
         if ctx.now - o.last_t <= max_age_s:
             pts.append(o.xy)
@@ -129,6 +130,8 @@ class Approach(Behavior):
             observe_people(ctx)  # keep track of people on every settled frame (the path check needs them)
         if ctx.now < self.settle_until or not ctx.new_frame or ctx.res is None or not ctx.frame_after_cmd():
             return RUNNING
+        if not ctx.res.target_ran:
+            return RUNNING  # the target detector skips frames: "no target" on this one means nothing
         t = ctx.res.target
         if t is None or not t.confirmed:
             return self._lost(ctx)

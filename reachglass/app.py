@@ -149,6 +149,9 @@ def run_tello(args, cfg) -> int:
     print("loading models...")
     perception = Perception.from_config(cfg)
     print(f"can look for: {', '.join(perception.vocabulary())}")
+    spec = cfg.perception.target_detector
+    what = spec.params.get("prompts") or spec.params.get("weights") or spec.params.get("hsv_ranges")
+    print(f"bottle detector: {spec.kind} {what} (--target color / yolo-world to switch)")
     source = drone.frame_source()
     if source.wait_first(10.0) is None:
         print("no video from the drone after 10 s")
@@ -215,6 +218,8 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("mode", choices=["sim", "tello"])
     p.add_argument("--config", help="YAML overrides (see reachglass/config.py)")
+    p.add_argument("--target", choices=["yolo-world", "color"], default=None,
+                   help="tello: how the bottle is found (default yolo-world; color = the colour-blob dummy)")
     p.add_argument("--dry-run", action="store_true", help="tello: video + telemetry only, motion commands NOT sent")
     p.add_argument("--no-takeoff", action="store_true", help="start directly in FOLLOW (drone held / already flying)")
     p.add_argument("--autostart", action="store_true", help="tello: take off immediately (default: wait for 'takeoff')")
@@ -233,7 +238,10 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(name)s: %(message)s")
     overrides = {"mission": {"takeoff": False}} if args.no_takeoff else None
-    cfg = load_config(args.config, overrides)
+    if args.mode == "sim" and args.target:
+        print("sim: the rendered bottle is always found by colour (it is sized like the real one); --target ignored")
+        args.target = None
+    cfg = load_config(args.config, overrides, target=args.target)
     if args.log is None:
         args.log = str(ROOT / "runs" / f"{args.mode}_{datetime.now():%Y%m%d_%H%M%S}.jsonl")
     return run_sim(args, cfg) if args.mode == "sim" else run_tello(args, cfg)

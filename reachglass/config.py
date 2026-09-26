@@ -2,6 +2,7 @@
 
     cfg = load_config("my_room.yaml")          # defaults + file
     cfg = load_config(overrides={"follow": {"distance_m": 1.8}})
+    cfg = load_config("site.yaml", target="color")   # a target preset on top (TARGET_PRESETS)
 
 Unknown keys raise, so a typo in a YAML file fails loudly instead of being ignored.
 Each module reads only its own section.
@@ -14,6 +15,38 @@ import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, get_type_hints
+
+
+# How the target (the team's blue Hydro Flask: 24 cm tall with its black cap, 9 cm wide) is found. The default
+# is "yolo-world"; "color" is the earlier colour-blob dummy. Switch with `--target color` or load_config(target=).
+# Measured on the team's photos placed at Tello-like distances (960 px input): YOLO-World finds it in 95-100 %
+# of views at 1.3-4 m (60 % at 6 m), nothing else in the rooms scores even 0.05; "blue water bottle" alone
+# still accepts a green or grey bottle, so the blue check on each box keeps only the team's bottle (>= 80 % of
+# a box's middle is blue for it, <= 24 % for other colours). 13 ms/frame on a Mac GPU, ~100 ms on a CPU.
+YOLO_WORLD_BOTTLE = {
+    "weights": "yolov8s-worldv2.pt",
+    "prompts": ["blue water bottle", "hydro flask water bottle"],
+    "rename": {"blue water bottle": "bottle", "hydro flask water bottle": "bottle"},
+    "classes": ["bottle"],
+    "conf": 0.2,
+    "imgsz": 960,  # the stream's own width: far (small) bottles keep their pixels
+    "agnostic_nms": True,  # two prompts, one bottle: one box
+    "require_color": {"hsv_ranges": [[95, 60, 40, 130, 255, 255]], "min_frac": 0.3},
+}
+# The colour dummy: the bottle's blue measured from a photo (hue 108-114, saturation ~165, brightness 85 on
+# the shadow side to 230). Greyish blues (mesh chairs, windows) have S < 100; blue jeans/shirts can match, the
+# person guard drops blobs inside a detected person's box.
+COLOR_BOTTLE = {"label": "bottle", "hsv_ranges": [[100, 100, 70, 122, 255, 255]], "min_area_frac": 0.0003,
+                "min_fill": 0.35, "max_aspect": 6.0}
+TARGET_PRESETS = {
+    "yolo-world": {"perception": {"target_detector": {"kind": "yolo", "params": YOLO_WORLD_BOTTLE},
+                                  "object_heights_m": {"bottle": 0.24}, "object_widths_m": {"bottle": 0.09}},
+                   "tracking": {"confirm_conf": 0.3}},
+    # the colour blob sees only the blue body (not the cap / steel ring): 0.19 m
+    "color": {"perception": {"target_detector": {"kind": "color_blob", "params": COLOR_BOTTLE},
+                             "object_heights_m": {"bottle": 0.19}, "object_widths_m": {"bottle": 0.09}},
+              "tracking": {"confirm_conf": 0.55}},
+}
 
 
 @dataclass
@@ -46,18 +79,9 @@ class CameraCfg:
 
 @dataclass
 class PerceptionCfg:
-    # The dummy target: the team's blue water bottle (24 cm tall, 9 cm wide, black cap), found by colour
-    # until the bottle model is trained. It is reported under `label`, so "find my water bottle" works.
-    # Its blue measured from a photo: hue 108-114, saturation ~165, brightness 85 (shadow side) to 230.
-    target_detector: ComponentSpec = field(default_factory=lambda: ComponentSpec("color_blob", {
-        "label": "bottle",
-        # saturated blue incl. its shadow side; greyish blues (mesh chairs, windows, sky glare) have S < 100.
-        # Blue jeans/shirts can match: the person guard drops blobs inside a detected person's box.
-        "hsv_ranges": [[100, 100, 70, 122, 255, 255]],
-        "min_area_frac": 0.0003,
-        "min_fill": 0.35,
-        "max_aspect": 6.0,
-    }))
+    # The target: the team's blue water bottle, reported as "bottle" so "find my water bottle" works.
+    # Default = the "yolo-world" preset (see TARGET_PRESETS above); `--target color` = the colour blob.
+    target_detector: ComponentSpec = field(default_factory=lambda: ComponentSpec("yolo", copy.deepcopy(YOLO_WORLD_BOTTLE)))
     person_detector: ComponentSpec = field(default_factory=lambda: ComponentSpec("yolo", {
         "weights": "yolo11n-pose.pt", "classes": ["person"], "conf": 0.4, "imgsz": 640}))
     # Furniture etc. for the exploration prior; set kind "" to disable.
@@ -68,9 +92,8 @@ class PerceptionCfg:
         "conf": 0.35, "imgsz": 640}))
     # Real heights (m) used to turn a pixel height into a distance. Measure your dummy/bottle!
     object_heights_m: dict = field(default_factory=lambda: {
-        # bottle: the dummy's BLUE part only (the colour blob does not see the cap/ring); a YOLO box covers
-        # the whole bottle: set 0.24 when using YOLO
-        "bottle": 0.19, "cup": 0.10, "backpack": 0.45, "chair": 0.85, "dining table": 0.75, "couch": 0.85,
+        # bottle: the whole bottle incl. cap, as a YOLO box covers it (the colour preset uses 0.19, the blue part)
+        "bottle": 0.24, "cup": 0.10, "backpack": 0.45, "chair": 0.85, "dining table": 0.75, "couch": 0.85,
         "bed": 0.60, "tv": 0.55, "laptop": 0.25, "refrigerator": 1.70, "potted plant": 0.60, "bench": 0.45,
         "sink": 0.20, "oven": 0.85, "microwave": 0.30, "toilet": 0.75, "suitcase": 0.60})
     # Widths (m) of ROUND objects (same width from every side). Used when the object's top or bottom is
@@ -80,11 +103,12 @@ class PerceptionCfg:
     person_height_sd_m: float = 0.05  # 0.02 once person_height_m is measured
     shoulder_width_m: float = 0.40
     body_width_m: float = 0.48  # bbox width of a person seen from behind
-    # which detectors run in which mode (1 = every frame, N = every Nth frame, 0 = never)
+    # which detectors run in which mode (1 = every frame, N = every Nth frame, 0 = never). The target detector
+    # skips frames: one detection is enough to confirm, and the scan waits until it has looked at each view.
     stride: dict = field(default_factory=lambda: {
         "follow": {"person": 1, "target": 0, "context": 0},
-        "search": {"person": 5, "target": 1, "context": 2},
-        "approach": {"person": 3, "target": 1, "context": 0},  # people: person guard (blue jeans) + safety
+        "search": {"person": 5, "target": 3, "context": 2},
+        "approach": {"person": 3, "target": 2, "context": 0},  # people: person guard (blue jeans) + safety
         "idle": {"person": 0, "target": 0, "context": 0},
     })
     # telemetry pitch sign so that nose-up is positive; 0 = do not use pitch (until checked on the drone)
@@ -98,8 +122,8 @@ class TrackingCfg:
     center_match_frac: float = 0.15  # ...or centre distance below this fraction of the image diagonal
     max_age_s: float = 1.5  # drop a track not seen for this long (>= lost_after_s, so re-locking works)
     confirm_hits: int = 3  # target lock: hits needed...
-    confirm_window: int = 5  # ...within this many frames
-    confirm_conf: float = 0.55  # or a single detection at least this confident
+    confirm_window: int = 5  # ...within this many runs of the detector (it may skip frames)
+    confirm_conf: float = 0.3  # or a single detection this confident that also looks right (size, distance)
     lost_after_s: float = 1.5  # locked target / person considered lost after this long unseen
 
 
@@ -134,7 +158,7 @@ class ExploreCfg:
     scan_altitude_m: float = 1.2
     scan_step_deg: int = 45
     dwell_s: float = 0.8  # wait after each rotation before using frames (video lag + settling)
-    frames_per_dwell: int = 3
+    frames_per_dwell: int = 2  # frames the TARGET detector looked at, per view (it skips frames)
     hop_min_m: float = 0.5  # also the longest step into a direction with no free-space evidence
     hop_max_m: float = 1.5
     max_vantage_points: int = 5
@@ -256,8 +280,9 @@ def _merge(obj: Any, over: dict, path: str) -> Any:
         raise TypeError(f"config section '{path.rstrip('.') or '<root>'}' must be a mapping, got {over!r}")
     hints = get_type_hints(type(obj))
     names = {f.name for f in dataclasses.fields(obj)}
-    # A component that switches implementation gets fresh params; same kind -> params are merged.
-    if isinstance(obj, ComponentSpec) and "kind" in over and over["kind"] != obj.kind:
+    # Naming a kind describes the whole component: fresh params (e.g. a trained YOLO replacing YOLO-World must
+    # not inherit its prompts). Only `params` given -> merged into the current ones.
+    if isinstance(obj, ComponentSpec) and "kind" in over and (over["kind"] != obj.kind or "params" in over):
         obj.params = {}
     for k, v in over.items():
         if k not in names:
@@ -297,13 +322,18 @@ def validate(cfg: Config) -> Config:
     return cfg
 
 
-def load_config(path: str | Path | None = None, overrides: dict | None = None) -> Config:
+def load_config(path: str | Path | None = None, overrides: dict | None = None, target: str | None = None) -> Config:
+    """Defaults, then the YAML file, then the target preset (TARGET_PRESETS), then overrides."""
     cfg = Config()
     if path:
         import yaml
 
         data = yaml.safe_load(Path(path).read_text()) or {}
         _merge(cfg, data, "")
+    if target:
+        if target not in TARGET_PRESETS:
+            raise ValueError(f"unknown target preset {target!r}; choose one of {sorted(TARGET_PRESETS)}")
+        _merge(cfg, copy.deepcopy(TARGET_PRESETS[target]), "")
     if overrides:
         _merge(cfg, overrides, "")
     return validate(cfg)

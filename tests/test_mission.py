@@ -64,7 +64,7 @@ def test_full_mission_follow_find_approach_guide_follow_land():
     assert r.mission.state == "FOLLOW" and r.sim.drone.collisions == 0
     px, py, ph = r.truth_person()
     d = r.sim.drone.pos
-    assert 1.2 < math.hypot(d[0] - px, d[1] - py) < 2.6 and abs(d[2] - cfg.follow.altitude_m) < 0.25
+    assert abs(math.hypot(d[0] - px, d[1] - py) - cfg.follow.distance_m) < 0.5 and abs(d[2] - cfg.follow.altitude_m) < 0.25
     # the query: remember where the drone and the person were (ground truth for the guidance check)
     r.run(26.0 - r.t - 1e-6)
     r.origin = (r.sim.drone.pos[0], r.sim.drone.pos[1], r.sim.drone.heading)

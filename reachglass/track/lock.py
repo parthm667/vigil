@@ -10,7 +10,8 @@ Rules
     (default: most confident; people use largest)
   * once locked, the lock follows that track_id only. It does NOT jump to another object of the
     same class while the locked one is still being tracked.
-  * confirmed: the track was matched in >= confirm_hits of the last confirm_window frames, or one
+  * confirmed: the track was matched in >= confirm_hits of the detector's last confirm_window runs (it may skip
+    frames: counting camera frames would make 3-of-5 impossible at every 3rd frame), or one
     detection with conf >= confirm_conf that also passes `plausible(det)` (e.g. a size check)
   * lost: not seen for lost_after_s. While lost, a new candidate close to the last position is
     preferred for re-locking; after the lock is released any candidate can be locked.
@@ -19,6 +20,7 @@ Rules
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -67,6 +69,7 @@ class TargetLock:
         self._last_seen_t: float | None = None
         self._confirmed = False
         self._needs_hits = False
+        self._runs: deque[int] = deque(maxlen=confirm_window)  # tracker frame indices the detector ran on
 
     def unseen_s(self, t: float) -> float:
         return math.inf if self._last_seen_t is None else t - self._last_seen_t
@@ -86,7 +89,8 @@ class TargetLock:
         tr = self.tracker.tracks.get(tid)
         if tr is None:
             return False
-        recent = [f for f in tr.seen_frames if f > self.tracker.frame_index - self.confirm_window]
+        first = self._runs[0] if self._runs else self.tracker.frame_index - self.confirm_window + 1
+        recent = [f for f in tr.seen_frames if f >= first]
         return len(recent) >= self.confirm_hits
 
     def _is_confirmed(self, tid: int, det: Detection) -> bool:
@@ -106,8 +110,15 @@ class TargetLock:
         size = max(a.w, a.h, 1.0)
         return math.hypot(b.cx - a.cx, b.cy - a.cy) > 2.0 * size
 
-    def update(self, detections: list[Detection], t: float, image_size: tuple[int, int] = (960, 720)) -> LockState:
-        """Returns a snapshot (a copy): later updates do not change states already handed out."""
+    def update(self, detections: list[Detection], t: float, image_size: tuple[int, int] = (960, 720),
+               ran: bool = True) -> LockState:
+        """Call after tracker.update on every frame; `ran` = did the detector for this class run on it.
+        Returns a snapshot (a copy): later updates do not change states already handed out."""
+        fi = self.tracker.frame_index
+        if self._runs and fi < self._runs[-1]:  # the tracker was reset
+            self._runs.clear()
+        if ran and (not self._runs or self._runs[-1] != fi):
+            self._runs.append(fi)
         return replace(self._update(detections, t, image_size))
 
     def _update(self, detections: list[Detection], t: float, image_size: tuple[int, int]) -> LockState:

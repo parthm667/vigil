@@ -135,10 +135,10 @@ class World:
         return True
 
 
-def dummy_bottle(x: float, y: float, base_z: float, height: float = 0.19, width: float = 0.09,
+def dummy_bottle(x: float, y: float, base_z: float, height: float = 0.24, width: float = 0.09,
                  color=(167, 92, 52)) -> list[Box]:
-    """The blue water bottle's blue body (BGR measured from a photo; the black cap is not drawn): a
-    '+'-shaped prism whose apparent width is ~constant from every direction (like a
+    """The team's blue water bottle, all blue (BGR measured from a photo) and as tall as the real one with its
+    cap, so the simulator's colour detector sees the same box a YOLO model sees on the drone: a '+'-shaped prism whose apparent width is ~constant from every direction (like a
     cylinder; a square box would look up to 41 % wider at 45 deg)."""
     a, b = width / 2, width * 0.41 / 2
     return [Box((x - a, y - b, base_z), (x + a, y + b, base_z + height), color, "bottle", solid=False),

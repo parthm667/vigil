@@ -79,7 +79,7 @@ def test_nested_dicts_deep_merge():
     w = cfg.explore.semantic_weights["bottle"]
     assert w["desk"] == 0.5 and w["dining table"] == 1.0  # sibling keys kept
     cfg = load_config(overrides={"perception": {"stride": {"search": {"context": 3}}}})
-    assert cfg.perception.stride["search"] == {"person": 5, "target": 1, "context": 3}
+    assert cfg.perception.stride["search"] == {"person": 5, "target": 3, "context": 3}
 
 
 # ------------------------------------------------------------------ colour blob (findings 6, 10)

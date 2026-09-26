@@ -5,10 +5,11 @@ A DJI Tello (standard model) hovers **behind and above the wearer's head**. When
 up to it, and works out where the object is **relative to where the person stood and which way they faced**.
 That result is the input to the next stage: guiding the person with the glasses.
 
-Until the bottle model is trained, the team's **blue water bottle** (24 cm tall, 9 cm wide, black cap) is
-the dummy. It is found by its colour (hue 100-122, measured from a photo) and reported as `bottle`, so
-"find my water bottle" works end to end today. The colour detector sees only the blue body (0.19 m), not
-the cap. A YOLO-World alternative that boxes the whole bottle is ready in `site.yaml`.
+The target is the team's **blue water bottle** (24 cm with its cap, 9 cm wide), reported as `bottle`. It is
+found by **YOLO-World** told "blue water bottle" / "hydro flask water bottle" (960 px, every 3rd frame while
+searching), plus a blue check on each box so another bottle is not taken for it. On the team's photos at
+Tello-like distances it finds the bottle in 95-100 % of views at 1.3-4 m, with no false detections; 13 ms/frame
+on a Mac GPU, ~100 ms on a CPU. `--target color` switches back to the colour-blob detector.
 
 ## 1. Setup (once per laptop)
 
@@ -96,8 +97,12 @@ actually find, so an unknown object gets "I can't look for keys yet" instead of 
 `query.LLMQueryParser` plugs in any language model (Grok, etc.) behind the same interface and rejects
 answers outside the vocabulary.
 
-## 5. Swapping in the trained bottle model (tomorrow)
+## 5. Switching the bottle detector
 
+- Check it live first: `python -m reachglass.tools.target_view tello --config site.yaml` (boxes, confidence,
+  distance, ms/frame).
+- One run with the colour dummy: `python -m reachglass tello --config site.yaml --target color`.
+- A trained model later (naming `kind` replaces all the detector's params):
 ```yaml
 perception:
   target_detector:
@@ -106,9 +111,6 @@ perception:
   object_heights_m: {bottle: 0.24}      # a YOLO box covers the whole bottle, cap included
   object_widths_m: {bottle: 0.09}
 ```
-Nothing else changes. Stock COCO YOLO does **not** reliably call this bottle a bottle (on the photo:
-`yolo11n` "cup" 0.27, `yolo11s` "vase" 0.44 / "bottle" 0.26). YOLO-World prompted with "blue water bottle"
-does (0.94): see `site.yaml`, and time it on the demo laptop first (~180 ms/frame on a CPU).
 
 ## 6. How it works (and what to swap)
 

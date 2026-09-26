@@ -1,8 +1,8 @@
-"""Dummy target detector: finds brightly coloured blobs and reports them under a chosen label.
+"""Colour target detector: finds brightly coloured blobs and reports them under a chosen label.
 
-Stands in for the bottle model until it is trained: the default colour is the team's blue water bottle,
-so with it in the room the whole pipeline behaves as if the bottle model had found it. Swap it for the trained
-model by changing `perception.target_detector` in the config; nothing else changes.
+The fallback for the bottle (`--target color`): the default colour is the team's blue water bottle, so with it
+in the room the whole pipeline behaves as if a bottle model had found it. The default target detector is
+YOLO-World (see config.TARGET_PRESETS); `hsv_mask` is also its colour check.
 
 Tune the colour on site: run `python -m reachglass.tools.hsv_picker` (step 12) or adjust `hsv_ranges`
 (OpenCV HSV: H 0-180, S 0-255, V 0-255; each range is [h_lo, s_lo, v_lo, h_hi, s_hi, v_hi]).
@@ -19,6 +19,31 @@ from ..types import Detection
 from .base import Detector
 
 
+def parse_hsv_ranges(hsv_ranges) -> list[tuple[int, ...]]:
+    """Validate [h_lo, s_lo, v_lo, h_hi, s_hi, v_hi] ranges; a wrap-around hue (h_lo > h_hi, e.g. red) is split."""
+    out = []
+    for r in hsv_ranges:
+        if len(r) != 6:
+            raise ValueError(f"hsv range needs 6 numbers [h_lo, s_lo, v_lo, h_hi, s_hi, v_hi], got {r}")
+        h0, s0, v0, h1, s1, v1 = (int(v) for v in r)
+        if not (0 <= h0 <= 180 and 0 <= h1 <= 180 and 0 <= s0 <= s1 <= 255 and 0 <= v0 <= v1 <= 255):
+            raise ValueError(f"hsv range out of bounds (H 0-180, S/V 0-255, lo <= hi): {r}")
+        if h0 > h1:  # written wrap-around style, e.g. [170, ..., 10, ...] for red
+            out += [(h0, s0, v0, 180, s1, v1), (0, s0, v0, h1, s1, v1)]
+        else:
+            out.append((h0, s0, v0, h1, s1, v1))
+    return out
+
+
+def hsv_mask(image: np.ndarray, ranges: list[tuple[int, ...]]) -> np.ndarray:
+    """255 where a BGR image's pixel is inside any of the parsed ranges."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    m = np.zeros(hsv.shape[:2], np.uint8)
+    for h0, s0, v0, h1, s1, v1 in ranges:
+        m |= cv2.inRange(hsv, (h0, s0, v0), (h1, s1, v1))
+    return m
+
+
 class ColorBlobDetector(Detector):
     name = "color_blob"
 
@@ -26,17 +51,7 @@ class ColorBlobDetector(Detector):
                  min_area_frac: float = 0.0003, min_fill: float = 0.35, max_aspect: float = 6.0,
                  ref_area_px: float = 900.0, max_detections: int = 5, blur: int = 5):
         self.label = label
-        self.ranges = []
-        for r in hsv_ranges:
-            if len(r) != 6:
-                raise ValueError(f"hsv range needs 6 numbers [h_lo, s_lo, v_lo, h_hi, s_hi, v_hi], got {r}")
-            h0, s0, v0, h1, s1, v1 = (int(v) for v in r)
-            if not (0 <= h0 <= 180 and 0 <= h1 <= 180 and 0 <= s0 <= s1 <= 255 and 0 <= v0 <= v1 <= 255):
-                raise ValueError(f"hsv range out of bounds (H 0-180, S/V 0-255, lo <= hi): {r}")
-            if h0 > h1:  # written wrap-around style, e.g. [170, ..., 10, ...] for red
-                self.ranges += [(h0, s0, v0, 180, s1, v1), (0, s0, v0, h1, s1, v1)]
-            else:
-                self.ranges.append((h0, s0, v0, h1, s1, v1))
+        self.ranges = parse_hsv_ranges(hsv_ranges)
         self.min_area_frac = min_area_frac
         self.min_fill = min_fill
         self.max_aspect = max_aspect
@@ -50,10 +65,7 @@ class ColorBlobDetector(Detector):
 
     def mask(self, image: np.ndarray) -> np.ndarray:
         img = cv2.GaussianBlur(image, (self.blur, self.blur), 0) if self.blur > 1 else image
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        m = np.zeros(hsv.shape[:2], np.uint8)
-        for h0, s0, v0, h1, s1, v1 in self.ranges:
-            m |= cv2.inRange(hsv, (h0, s0, v0), (h1, s1, v1))
+        m = hsv_mask(img, self.ranges)
         k = np.ones((3, 3), np.uint8)
         m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
         return cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=2)

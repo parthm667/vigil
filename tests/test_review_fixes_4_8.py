@@ -50,8 +50,10 @@ def test_one_frame_false_blob_does_not_block_the_real_target():
     per = Perception(load_config(), None, Scripted(["bottle"], lambda i: [garbage, bottle(712)] if i == 1 else [bottle(712)]), None)
     per.set_mode("search")
     per.set_target("bottle")
-    rs = [per.update(frame(i)) for i in range(15)]  # 0.5 s at 30 fps
-    assert rs[-1].target is not None and rs[-1].target.det.cx == pytest.approx(712, abs=1) and rs[-1].target.confirmed
+    rs = [per.update(frame(i)) for i in range(15)]  # 0.5 s at 30 fps; searching: the detector looks at every 3rd
+    looked = [r for r in rs if r.target_ran]
+    assert len(looked) == 5 and looked[-1].target is not None and looked[-1].target.confirmed
+    assert looked[-1].target.det.cx == pytest.approx(712, abs=1)
     assert rs[-1].target_unseen_s < 0.1
 
 
@@ -69,12 +71,14 @@ def test_confirmed_lock_does_not_jump_via_centre_fallback():
 
 def test_relock_after_a_gap_with_default_timing():
     cfg = load_config()
-    seq = [[bottle(400)]] * 5 + [[]] * 36 + [[bottle(410)]] * 3  # 1.2 s gap at 30 fps
+    # per detector RUN (approaching: every 2nd frame at 30 fps = 15 runs/s): seen, a 1.2 s gap, seen again
+    seq = [[bottle(400)]] * 3 + [[]] * 18 + [[bottle(410)]] * 3
     per = Perception(cfg, None, Scripted(["bottle"], lambda i: seq[i - 1] if i <= len(seq) else []), None)
     per.set_mode("approach")
     per.set_target("bottle")
-    rs = [per.update(frame(i)) for i in range(len(seq))]
-    assert rs[-1].target is not None and rs[-1].target.det.cx == pytest.approx(410, abs=1)
+    rs = [per.update(frame(i)) for i in range(2 * len(seq))]
+    last = [r for r in rs if r.target_ran][-1]
+    assert last.target is not None and last.target.det.cx == pytest.approx(410, abs=1)
 
 
 def test_repeated_frame_is_not_a_new_sighting():
@@ -98,8 +102,10 @@ def test_context_class_target_is_seen_in_approach_mode():
     [per.update(frame(i)) for i in range(4)]
     per.set_mode("approach")
     rs = [per.update(frame(i)) for i in range(4, 20)]
-    assert all(r.ran["context"] for r in rs)
-    assert rs[-1].target is not None and rs[-1].target.confirmed
+    # its approach stride is 0, but it reports the target: it runs at the target's rate (every 2nd frame)
+    assert [r.ran["context"] for r in rs] == [i % 2 == 0 for i in range(16)]
+    looked = [r for r in rs if r.target_ran]
+    assert looked[-1].target is not None and looked[-1].target.confirmed
 
 
 def test_red_shirt_suppressed_between_person_runs_and_in_approach():
