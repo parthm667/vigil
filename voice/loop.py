@@ -6,6 +6,8 @@ triple = send "stop". (Never mapped to "land": too easy to press by accident.)
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
 
 from . import earcons
@@ -94,6 +96,22 @@ class VoiceApp:
               f"(-> {self.cfg.send_host}:{self.cfg.send_port}, <- :{self.cfg.announce_port})")
         self.speaker.speak("Voice control ready. Just talk.")
         self._quiet_until = 0.0
+        self.recorder.trailing_silence_s = min(self.recorder.trailing_silence_s, 0.55)  # commands are
+        # short phrases: end the utterance sooner than push-to-talk's 0.8 s
+        stt_q: queue.Queue = queue.Queue()
+
+        def stt_worker() -> None:  # transcribe OFF the listen loop: the mic and TTS never stall
+            while True:
+                audio = stt_q.get()
+                if audio is None:
+                    return
+                t0 = time.time()
+                text = self.stt.transcribe(audio)
+                if text:
+                    self._handle_heard(text, time.time() - t0)
+
+        worker = threading.Thread(target=stt_worker, daemon=True)
+        worker.start()
 
         def paused() -> bool:
             if self.speaker.busy:
@@ -113,28 +131,26 @@ class VoiceApp:
                 print("[voice] triple press -> stop")
                 self._send("stop")
 
-        def on_utterance(audio) -> None:
-            text = self.stt.transcribe(audio)
-            if not text:
-                return
-            low = text.lower()
-            if not any(k in low for k in self.KEYWORDS):
-                print(f"[voice] heard {text!r}: no command word, ignoring")
-                return
-            print(f"[voice] heard: {text!r}")
-            earcons.play(earcons.got_it_blip())
-            self._send(text)
-            if any(w in low for w in ("find", "where")):
-                self.last_find = text
-
         try:
-            self.recorder.listen(on_utterance, paused=paused, tick=tick)
+            self.recorder.listen(stt_q.put, paused=paused, tick=tick)
         except KeyboardInterrupt:
             print("\n[voice] bye")
         finally:
+            stt_q.put(None)
             self.rx.close()
             self.speaker.close()
         return 0
+
+    def _handle_heard(self, text: str, stt_s: float) -> None:
+        low = text.lower()
+        if not any(k in low for k in self.KEYWORDS):
+            print(f"[voice] heard {text!r} ({stt_s:.1f}s): no command word, ignoring")
+            return
+        print(f"[voice] heard: {text!r} (stt {stt_s:.1f}s)")
+        earcons.play(earcons.got_it_blip())
+        self._send(text)
+        if any(w in low for w in ("find", "where")):
+            self.last_find = text
 
     def repeat(self) -> None:
         """Re-speak the last announcement now, and nudge the mission to refresh

@@ -85,6 +85,9 @@ def main(argv=None) -> int:
     cfg = VoiceCfg()
     if args.stt:
         cfg.stt_model = args.stt
+    elif args.hands_free:
+        cfg.stt_model = "tiny.en"  # command phrases only: 3-4x faster than base.en on CPU,
+        print("[voice] hands-free: using tiny.en for speed (--stt base.en to override)")
     if args.device:
         cfg.input_substr = args.device
     if args.send_port:
