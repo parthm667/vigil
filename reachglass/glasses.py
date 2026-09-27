@@ -9,14 +9,21 @@ app's TTS); the once-a-second repeats of the same cue are not, so the wearer is 
 
 The firmware module (firmware/host/reachglass_glasses.py) is imported read-only from its own
 folder. If the glasses are unreachable or glasses.enabled is false, cues still print and speak.
+
+GlassesTargetView runs the target detector on the glasses' ESP32-CAM stream (the wearer's point of view)
+for the last metres of GUIDE: the bottle's bearing (+ = to the wearer's right) and distance.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import logging
+import math
+import threading
 from pathlib import Path
 from typing import Callable
+
+import cv2
 
 log = logging.getLogger("reachglass.glasses")
 
@@ -24,13 +31,69 @@ SPOKEN = {-1: "Turn left.", 0: "Walk forward.", 1: "Turn right.",
           2: "You're there. It's right in front of you."}
 
 
-def _glasses_link():
-    """The GlassesLink class from firmware/host (imported from its file; firmware is read-only)."""
+def _firmware():
+    """firmware/host/reachglass_glasses.py (imported from its file; firmware is read-only)."""
     path = Path(__file__).resolve().parents[1] / "firmware" / "host" / "reachglass_glasses.py"
     spec = importlib.util.spec_from_file_location("reachglass_glasses", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.GlassesLink
+    return mod
+
+
+def _glasses_link():
+    return _firmware().GlassesLink
+
+
+ROTATIONS = {"ccw": cv2.ROTATE_90_COUNTERCLOCKWISE, "cw": cv2.ROTATE_90_CLOCKWISE, "180": cv2.ROTATE_180}
+
+
+class GlassesTargetView:
+    """The target seen from the glasses camera. poll() is non-blocking: None when no new detector run, else
+    (seen, bearing_deg, range_m): bearing + = right of the wearer's view; range None when the box is cut."""
+
+    def __init__(self, gcfg, detector, target_cls: str, height_m: float | None, stride: int = 3):
+        self.detector, self.cls, self.height_m, self.stride = detector, target_cls, height_m, max(1, stride)
+        self.rotate = ROTATIONS.get(gcfg.camera_rotate)  # the camera is mounted turned: frames upright first
+        self.f = gcfg.camera_f_px
+        self.src = None
+        self.closed = False
+        self.seq, self.n = -1, 0
+        # opening the MJPEG stream can block for seconds: never in the control loop
+        threading.Thread(target=self._open, args=(gcfg.camera_url,), daemon=True).start()
+
+    def _open(self, url: str) -> None:
+        try:
+            src = _firmware().GlassesVideoSource(url=url).start()
+            if self.closed:
+                src.stop()  # closed while it was connecting: the CAM serves one client, let it go
+            else:
+                self.src = src
+        except Exception as e:  # noqa: BLE001 (no glasses camera: guiding goes on with the drone's camera)
+            log.warning("glasses camera unavailable (%s: %s)", type(e).__name__, e)
+
+    def poll(self):
+        f = self.src.read() if self.src is not None else None
+        if f is None or f.seq == self.seq:
+            return None
+        self.seq, self.n = f.seq, self.n + 1
+        if self.n % self.stride:
+            return None
+        img = cv2.rotate(f.image, self.rotate) if self.rotate is not None else f.image
+        dets = [d for d in self.detector.detect(img) if d.cls == self.cls]
+        if not dets:
+            return False, None, None
+        d = max(dets, key=lambda x: x.conf)
+        h, w = img.shape[:2]
+        bearing = math.degrees(math.atan((d.cx - w / 2) / self.f))
+        cut = d.bbox[1] <= 2 or d.bbox[3] >= h - 2
+        rng = self.f * self.height_m / d.h if (self.height_m and not cut and d.h > 0) else None
+        return True, bearing, rng
+
+    def close(self) -> None:
+        self.closed = True
+        src, self.src = self.src, None
+        if src is not None:
+            src.stop()
 
 
 class HapticCues:

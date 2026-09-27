@@ -244,6 +244,14 @@ class GuideCfg:
     center_deg: float = 18.0  # turn the drone when the wearer is this far off-centre
     replan_m: float = 0.8  # re-plan when the wearer is this far off the path
     cue_hz: float = 4.0  # repeat the current cue this often (and at once when it changes)
+    # the last metres on the glasses camera (needs glasses.enabled; object targets only, not a person):
+    glasses_handoff: bool = True
+    handoff_m: float = 2.5  # the drone measures the wearer this close to the target AND...
+    handoff_facing_deg: float = 30.0  # ...facing within this of it -> glasses camera only (never before, never back)
+    glasses_stride: int = 3  # detector on every Nth glasses frame (~4 Hz at 12 fps)
+    glasses_forward_deg: float = 8.0  # glasses cue 0 (forward) below this bearing, kept until...
+    glasses_forward_exit_deg: float = 15.0  # ...it exceeds this
+    glasses_lost_s: float = 8.0  # on the glasses camera, target not seen this long (connecting included): FAILURE
     lost_turn_s: float = 1.5  # wearer not seen this long: turn toward where they were
     # closer than ~1 m to the drone the wearer fills the frame's width and cannot be measured: last measured within
     # the arrival distance + lost_close_m, then unmeasurable for lost_close_s (still walking in) -> arrived
@@ -314,12 +322,15 @@ class MissionCfg:
 
 @dataclass
 class GlassesCfg:
-    """The glasses' Nano (haptic pads + ToF) over the CAM's "rover" WiFi; firmware/HARDWARE_INTERFACE.md.
-    Video from the glasses camera is separate and not configured here."""
+    """The glasses' Nano (haptic pads + ToF) and ESP32-CAM over the CAM's "rover" WiFi;
+    firmware/HARDWARE_INTERFACE.md. Two different boards: video from the CAM, data from the Nano."""
 
     enabled: bool = False  # drive the haptic pads from the guide cues (needs the 2nd WiFi adapter on "rover")
     host: str = ""  # the Nano; "" = discovery beacon, else its static 192.168.4.50
     max_press: int = 100  # host-side ceiling on press depth 0-100 (the Nano clamps again)
+    camera_url: str = "http://192.168.4.1/stream"  # the ESP32-CAM (NOT the Nano's address)
+    camera_rotate: str = "ccw"  # mounted turned 90 deg clockwise (floor on the frame's left): rotate back ("" = none)
+    camera_f_px: float = 640.0  # focal length in px, OV2640 VGA guess (~53 deg across 640 px): calibrate it
 
 
 @dataclass
