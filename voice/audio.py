@@ -1,0 +1,104 @@
+"""Push-to-talk microphone capture, AirPods-profile aware.
+
+The AirPods stay in A2DP (stereo, no mic) until an app opens their capture
+endpoint, which flips them to HFP (mono 16 kHz) for exactly as long as the
+stream is open. So the recorder opens the input stream ON DEMAND and closes it
+the moment the utterance ends -- never hold it open, never rely on mute.
+
+Devices are re-resolved by NAME on every open: WASAPI device indices shift when
+the Bluetooth profile flips or the AirPods reconnect.
+"""
+
+from __future__ import annotations
+
+import queue
+import time
+
+import numpy as np
+
+
+def find_input_device(substr: str) -> tuple[int | None, str]:
+    """Index and name of the first input device whose name contains substr
+    (case-insensitive), or (None, <default device name>) to use the default mic."""
+    import sounddevice as sd
+
+    want = substr.lower()
+    for i, dev in enumerate(sd.query_devices()):
+        if dev["max_input_channels"] > 0 and want in dev["name"].lower():
+            return i, dev["name"]
+    try:
+        default = sd.query_devices(kind="input")["name"]
+    except Exception:
+        default = "system default"
+    return None, default
+
+
+class Recorder:
+    def __init__(self, input_substr: str = "AirPods", rate: int = 16000,
+                 max_s: float = 6.0, trailing_silence_s: float = 0.8,
+                 silence_rms: float = 0.010):
+        self.input_substr = input_substr
+        self.rate = rate
+        self.max_s = max_s
+        self.trailing_silence_s = trailing_silence_s
+        self.silence_rms = silence_rms
+
+    def record(self, on_live=None) -> np.ndarray:
+        """Open the mic, capture one utterance, close the mic, return float32 mono.
+
+        on_live() is called once, from the moment audio is actually flowing --
+        that is when the A2DP->HFP switch has completed and the user should be
+        cued to speak (play the chirp there, not before opening the stream).
+
+        Endpointing: stop after trailing_silence_s of quiet FOLLOWING speech,
+        or at max_s. If the user never speaks, returns after ~2.5s of silence.
+        """
+        import sounddevice as sd
+
+        idx, name = find_input_device(self.input_substr)
+        if idx is None:
+            print(f"[audio] no '{self.input_substr}' input found -> using {name}")
+        q: queue.Queue[np.ndarray] = queue.Queue()
+
+        def callback(indata, frames, t, status):
+            q.put(indata[:, 0].copy())
+
+        blocks: list[np.ndarray] = []
+        started_speaking = False
+        quiet_s = 0.0
+        cued = False
+        with sd.InputStream(samplerate=self.rate, channels=1, dtype="float32",
+                            device=idx, blocksize=int(self.rate * 0.05),
+                            callback=callback):
+            t0 = time.time()
+            while time.time() - t0 < self.max_s:
+                try:
+                    block = q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if not cued:
+                    cued = True
+                    if on_live is not None:
+                        on_live()
+                    # everything before the cue is profile-switch garbage
+                    blocks.clear()
+                    continue
+                blocks.append(block)
+                dur = block.size / self.rate
+                if float(np.sqrt(np.mean(block**2))) >= self.silence_rms:
+                    started_speaking = True
+                    quiet_s = 0.0
+                else:
+                    quiet_s += dur
+                    if started_speaking and quiet_s >= self.trailing_silence_s:
+                        break
+                    if not started_speaking and quiet_s >= 2.5:
+                        break
+        return np.concatenate(blocks) if blocks else np.zeros(0, dtype=np.float32)
+
+
+def play(data: np.ndarray, rate: int = 16000) -> None:
+    """Blocking playback (used by the selftest to echo the recording)."""
+    import sounddevice as sd
+
+    sd.play(data, rate, blocking=True)

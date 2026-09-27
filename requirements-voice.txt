@@ -1,0 +1,8 @@
+# Voice layer (AirPods Pro 2 on Windows 11) — installed separately from the flight
+# stack on purpose: a failed audio-lib install must never break `python -m reachglass`.
+#   .venv\Scripts\pip install -r requirements-voice.txt
+winsdk>=1.0.0b10        # SMTC stem-press interception via WinRT (py3.12 wheels since b10)
+sounddevice>=0.4.6      # WASAPI capture/playback; bundles PortAudio DLLs on Windows
+faster-whisper>=1.0     # local STT, CTranslate2 int8 on CPU (no CUDA needed)
+edge-tts>=6.1           # neural TTS (online); pyttsx3/SAPI is the offline fallback
+pyttsx3>=2.98           # >=2.98 for Python 3.12 fixes
