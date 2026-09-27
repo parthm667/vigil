@@ -1,7 +1,7 @@
 """Mission state machine.
 
-    TAKEOFF -> CLIMB -> FOLLOW --(query "find X")--> EXPLORE -> APPROACH -> ARRIVED (hovering just past the object)
-    (the search starts at the follow altitude: no descent)
+    TAKEOFF -> CLIMB -> FOLLOW --(query "find X")--> DESCEND (to explore.scan_altitude_m) -> EXPLORE -> APPROACH -> ARRIVED (hovering just past the object)
+    (the search starts at the follow altitude: no descent)      -> GUIDE (look back, walking path, cues) -> LAND
                           ^                                      |            |          |
                           +------------- REACQUIRE <--------------+-(failed)---+---(query "follow me")
     any state: "land" -> LAND -> LANDED;  "stop"/"cancel" -> REACQUIRE (back to following)
@@ -9,6 +9,8 @@
 When the query arrives the mission frame is reset at the drone (x = its heading), and the person's
 position and facing are recorded: that is what the guidance (turn / distance for the person) is
 computed against once the target is reached. announce() is the audio hook (printed for now).
+GUIDE (behaviors/guide.py) then walks the wearer to the target: cue() gets -1 (turn left) / 0 (forward) /
++1 (turn right) continuously and 2 on arrival (printed for now; the glasses' hook), then the drone lands.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ import logging
 import math
 from typing import Callable
 
-from ..behaviors import FAILURE, RUNNING, SUCCESS, Approach, Behavior, Ctx, Discrete, Explore, FollowBehind, ReacquirePerson
+from ..behaviors import (FAILURE, RUNNING, SUCCESS, Approach, Behavior, Ctx, Discrete, Explore, FollowBehind, Guide,
+                         ReacquirePerson)
 from ..mapping import Grid, SemanticMemory
 from ..query import ParsedQuery, QueryParser
 from ..types import wrap_deg
@@ -25,15 +28,24 @@ from .guidance import Guidance, compute_guidance
 
 log = logging.getLogger("reachglass.mission")
 
-STATES = ("IDLE", "TAKEOFF", "CLIMB", "FOLLOW", "EXPLORE", "APPROACH", "ARRIVED", "REACQUIRE", "HOLD",
+STATES = ("IDLE", "TAKEOFF", "CLIMB", "FOLLOW", "DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "GUIDE", "REACQUIRE", "HOLD",
           "LAND", "LANDED")
 
 
+def print_cue(cue: int, detail: str) -> None:
+    print(f"guide cue: {cue:2d}   {detail}", flush=True)
+
+
 class Mission:
-    def __init__(self, ctx: Ctx, parser: QueryParser, announce: Callable[[str], None] | None = None):
+    def __init__(self, ctx: Ctx, parser: QueryParser, announce: Callable[[str], None] | None = None,
+                 cue: Callable[[int, str], None] | None = None):
         self.ctx = ctx
         self.parser = parser
         self.announce_fn = announce or (lambda s: print(f"[say] {s}", flush=True))
+        self.cue_fn = cue or print_cue  # guidance cues: -1 left / 0 forward / 1 right / 2 arrived
+        self.cues: list[tuple[float, int]] = []  # (t, cue) as emitted
+        self._guide_target: tuple[float, float] | None = None
+        self._guide_top: float | None = None
         self.state = "IDLE"
         self.state_t = 0.0
         self.child: Behavior | None = None
@@ -49,6 +61,13 @@ class Mission:
         self._land_sent = -1e9
 
     # ------------------------------------------------------------------ helpers
+    def emit_cue(self, cue: int, detail: str = "") -> None:
+        self.cues.append((self.ctx.now, cue))
+        self.cue_fn(cue, detail)
+
+    def _new_guide(self) -> Guide:
+        return Guide(self.ctx.cfg.guide, self._guide_target, self._guide_top, self.emit_cue)
+
     def announce(self, text: str) -> None:
         self.said.append((self.ctx.now, text))
         if self.ctx.cfg.mission.announce:
@@ -101,8 +120,10 @@ class Mission:
     def resume(self) -> None:
         if self.state == "HOLD":
             prev = self._resume_state
-            if prev in ("EXPLORE", "APPROACH", "ARRIVED") and self.ctx.target_cls:
-                self._go("EXPLORE", "resume search", Explore(self.ctx.cfg.explore))
+            if prev == "GUIDE" and self._guide_target is not None:
+                self._go("GUIDE", "resume guiding", self._new_guide())
+            elif prev in ("DESCEND", "EXPLORE", "APPROACH", "ARRIVED") and self.ctx.target_cls:
+                self._go("DESCEND", "resume search")
             else:
                 self._go("REACQUIRE", "resume", ReacquirePerson())
 
@@ -123,13 +144,13 @@ class Mission:
         if q.intent == "land":
             self._land("asked to land")
         elif q.intent == "cancel":
-            if self.state in ("EXPLORE", "APPROACH", "ARRIVED", "HOLD"):
+            if self.state in ("DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "GUIDE", "HOLD"):
                 self.ctx.drone.stop()
                 self.announce("Okay, stopping. Coming back to you.")
                 self._reacquire("cancelled")
         elif q.intent == "follow":
             lost = self.ctx.res is None or self.ctx.res.person_unseen_s > 2.0
-            if self.state in ("EXPLORE", "APPROACH", "ARRIVED", "HOLD") or (self.state == "FOLLOW" and lost):
+            if self.state in ("DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "GUIDE", "HOLD") or (self.state == "FOLLOW" and lost):
                 self.ctx.drone.stop()
                 self.announce("Coming back to you." if self.state != "FOLLOW" else "Looking for you.")
                 self._reacquire("asked to follow")
@@ -140,10 +161,10 @@ class Mission:
                 what = q.unknown_target or "that"
                 self.announce(f"Sorry, I can't look for {what} yet. I can look for: {', '.join(vocab[:8])}.")
                 return
-            if self.state in ("EXPLORE", "APPROACH") and q.target == self.ctx.target_cls:
+            if self.state in ("DESCEND", "EXPLORE", "APPROACH") and q.target == self.ctx.target_cls:
                 self.announce(f"Still looking for your {q.target}.")  # a repeat must not restart the search
                 return
-            if self.state in ("FOLLOW", "ARRIVED", "HOLD", "REACQUIRE", "EXPLORE", "APPROACH"):
+            if self.state in ("FOLLOW", "ARRIVED", "GUIDE", "HOLD", "REACQUIRE", "DESCEND", "EXPLORE", "APPROACH"):
                 self.ctx.drone.stop()
                 self._begin_search(q.target)
             elif self.state in ("TAKEOFF", "CLIMB"):
@@ -185,8 +206,9 @@ class Mission:
             if facing is not None:
                 ctx.person_heading = wrap_deg(ctx.odom.pose.heading_deg + p.bearing_deg + facing)
         self.guidance = None
+        self._guide_target, self._guide_top = None, None
         self.announce(f"Looking for your {target}.")
-        self._go("EXPLORE", f"search for {target}", Explore(self.ctx.cfg.explore))
+        self._go("DESCEND", f"search for {target}")
 
     def _smoothed_facing(self, p) -> float | None:
         """The follow behaviour's circular mean of recent confident facings, else this frame's if confident."""
@@ -249,6 +271,18 @@ class Mission:
             self.child.step(ctx)
             if ctx.res is not None and ctx.res.person_unseen_s > 20.0 and ctx.now - self.state_t > 20.0:
                 self._reacquire("person lost for 20 s")
+        elif st == "DESCEND":
+            if self.cmd is None:
+                alt = ctx.altitude
+                cm = int(round((alt - cfg.explore.scan_altitude_m) * 100)) if alt is not None else 0
+                if abs(cm) < 20:
+                    self._go("EXPLORE", "at scan altitude", Explore(cfg.explore))
+                    return
+                self.cmd = Discrete("move", min(abs(cm), 200), "down" if cm > 0 else "up")
+            r = self.cmd.step(ctx)
+            if r != RUNNING:
+                self.cmd = None
+                self._go("EXPLORE", "descended" if r == SUCCESS else f"descend: {d.last_result()}", Explore(cfg.explore))
         elif st == "EXPLORE":
             r = self.child.step(ctx)
             if r == SUCCESS:
@@ -280,6 +314,16 @@ class Mission:
                     self._reacquire(self.child.status)
         elif st == "ARRIVED":
             d.rc(0, 0, 0, 0)  # hover next to the target as a beacon (keep-alive)
+            if cfg.guide.enabled and self._guide_target is not None:
+                self._go("GUIDE", "guide the wearer to it", self._new_guide())
+        elif st == "GUIDE":
+            r = self.child.step(ctx)
+            if r == SUCCESS:
+                self.announce(f"You made it. Your {ctx.target_cls} is right in front of you.")
+                self._land(f"guided to the {ctx.target_cls}: {self.child.status}")
+            elif r == FAILURE:
+                self.announce(f"I can't guide you any more ({self.child.status}).")
+                self._land(f"guide failed: {self.child.status}")
         elif st == "REACQUIRE":
             self._step_reacquire()
         elif st == "HOLD":
@@ -301,6 +345,8 @@ class Mission:
         target_xy = obj.xy if obj is not None else ctx.odom.pose.point_at(ctx.cfg.approach.standoff_m, 0.0)
         self.guidance = compute_guidance(ctx.target_cls, target_xy, ctx.person_origin, ctx.person_heading)
         self.announce(self.guidance.text)
+        self._guide_target = target_xy
+        self._guide_top = getattr(self.child, "last_top", None)  # the object's top, measured by the approach
         self._go("ARRIVED", why)
 
     def _step_reacquire(self) -> None:

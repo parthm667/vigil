@@ -30,8 +30,9 @@ FOOTPRINT = {"dining table": 0.6, "couch": 0.8, "bed": 0.9, "chair": 0.3, "refri
              "person": 0.5}
 
 
-def observe(ctx: Ctx, mark_view: bool = True) -> None:
-    """Put one fresh perception result into memory and the grid."""
+def observe(ctx: Ctx, mark_view: bool = True, exclude: list[tuple[float, float, float]] = ()) -> None:
+    """Put one fresh perception result into memory and the grid. exclude: (x, y, radius) zones where furniture
+    detections are ignored (e.g. the backpack of the person being tracked)."""
     res = ctx.res
     if res is None:
         return
@@ -49,6 +50,8 @@ def observe(ctx: Ctx, mark_view: bool = True) -> None:
         if o.range_m is None:
             continue
         x, y = pose.point_at(o.range_m, o.bearing_deg)
+        if any(math.hypot(x - ex, y - ey) <= er for ex, ey, er in exclude):
+            continue
         ctx.memory.add(o.cls, x, y, o.det.conf, o.range_m, ctx.now, ctx.vantage)
         # how high does it reach? from the elevation of its box's top edge (a size prior would miss a TV on a
         # stand); a box cut by the top of the image, or no altitude: treat as reaching flight level

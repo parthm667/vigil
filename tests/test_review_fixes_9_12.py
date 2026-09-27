@@ -113,7 +113,7 @@ def test_hold_is_ignored_during_takeoff():
 def test_repeated_find_does_not_restart_and_new_find_keeps_the_person():
     r, said = runner([(10.0, "find my water bottle")])
     r.run(14.0)
-    assert r.mission.state in ("EXPLORE", "APPROACH")
+    assert r.mission.state in ("DESCEND", "EXPLORE", "APPROACH")
     origin = r.ctx.person_origin
     n_states = len(r.mission.history)
     r.mission.query("find my water bottle")
@@ -142,7 +142,7 @@ def test_find_while_taking_off_is_handled_once_following():
     r, said = runner([(0.5, "find my water bottle")])
     r.run(12.0)
     assert sum("still taking off" in s for s in said) == 1
-    assert "EXPLORE" in states(r)
+    assert "DESCEND" in states(r) or "EXPLORE" in states(r)
 
 
 def test_find_after_landing_is_answered_not_looped():

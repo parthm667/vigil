@@ -1,7 +1,7 @@
 """Perception pipeline: one frame (+ telemetry) in, one PerceptionResult out.
 
     per = Perception.from_config(cfg)
-    per.set_mode("follow")               # follow | search | approach | idle  (which detectors run)
+    per.set_mode("follow")               # follow | search | approach | guide | idle  (which detectors run)
     per.set_target("bottle")             # class to lock for search/approach
     res = per.update(frame, telemetry)   # PerceptionResult (types.py)
 
@@ -22,7 +22,7 @@ from .person import PersonEstimator
 from .track import SimpleTracker, TargetLock, largest, most_confident
 from .types import Detection, Frame, ObjectObs, PerceptionResult, Telemetry, TargetObs
 
-MODES = ("follow", "search", "approach", "idle")
+MODES = ("follow", "search", "approach", "guide", "idle")
 MIN_WIDTH_PX = 25  # below this a width-based range is too coarse and blur-inflated (2 px blur = 8 % at 25 px)
 
 

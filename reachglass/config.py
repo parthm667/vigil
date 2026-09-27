@@ -109,6 +109,7 @@ class PerceptionCfg:
         "follow": {"person": 1, "target": 0, "context": 0},
         "search": {"person": 5, "target": 3, "context": 2},
         "approach": {"person": 3, "target": 2, "context": 0},  # people: person guard (blue jeans) + safety
+        "guide": {"person": 1, "target": 0, "context": 3},  # track the wearer every frame, keep mapping furniture
         "idle": {"person": 0, "target": 0, "context": 0},
     })
     # telemetry pitch sign so that nose-up is positive; 0 = do not use pitch (until checked on the drone)
@@ -158,6 +159,7 @@ class FollowCfg:
 
 @dataclass
 class ExploreCfg:
+    scan_altitude_m: float = 1.3  # descend to this before searching
     scan_step_deg: int = 45
     dwell_s: float = 0.8  # wait after each rotation before using frames (video lag + settling)
     frames_per_dwell: int = 2  # frames the TARGET detector looked at, per view (it skips frames)
@@ -194,6 +196,53 @@ class ApproachCfg:
     # "pid": align with a discrete rotate by the bearing. "fly": the fruit fly controller turns onto the target
     # with continuous rc yaw (see FlyCfg); forward moves, descents and sidesteps stay discrete.
     steering: str = "pid"
+
+
+@dataclass
+class GuideCfg:
+    """GUIDE, the last stage (behaviors/guide.py, mapping/walkpath.py): after arriving at the target, look back,
+    find the wearer, plan a walking path and cue them along it (-1 left / 0 forward / +1 right, 2 = arrived),
+    then land."""
+
+    enabled: bool = True  # false: stay in ARRIVED, hovering by the target
+    lower: bool = False  # after a fly-over, descend just above the object (off: stay at flight height, above heads)
+    above_object_m: float = 0.3  # after flying over it: descend to this far above the object's top...
+    min_altitude_m: float = 1.0  # ...but not below this (keeps the wearer's head and torso in view)
+    unknown_top_m: float = 1.0  # the object's top (above the floor) when it was never measured
+    look_deg: float = 45.0  # look-back: toward the wearer, then this far to the left and to the right
+    settle_s: float = 0.5  # after a rotation/move, before frames count (on top of drone.video_lag_s)
+    view_person_runs: int = 3  # person-detector runs per look-back view...
+    view_context_runs: int = 2  # ...and furniture-detector runs
+    view_timeout_s: float = 3.0
+    acquire_gate_m: float = 2.5  # the wearer = the person nearest to where they stood, within this
+    wearer_exclude_m: float = 0.5  # furniture detected this close to the wearer is theirs (a backpack): ignored
+    inflate_m: float = 0.4  # walking map: keep the body's centre this far from obstacle footprints
+    unknown_cost: float = 1.5  # cost of never-proven-clear cells (1 = proven clear)
+    goal_slack_m: float = 0.3  # goal: of the walkable cells this close to the nearest one, the cheapest to reach
+    lookahead_m: float = 0.8  # aim this far ahead along the path
+    forward_deg: float = 15.0  # cue 0 (forward) when the heading error drops below this...
+    forward_exit_deg: float = 30.0  # ...and keep it until the error exceeds this
+    raised_top_m: float = 0.4  # target's top above this: it stands on furniture (table), so the walk...
+    raised_stop_m: float = 1.0  # ...ends this far from it, in front of the furniture (its edge is in between)
+    arrive_m: float = 0.5  # cue 2: the wearer's feet this close to the target; if the walk has to end farther
+    reach_slack_m: float = 0.15  # away (on a table): its end's distance to the target + this
+    arrive_frames: int = 2  # consecutive position measurements that must agree
+    smooth: float = 0.5  # weight of a new position measurement (exponential smoothing)
+    track_gate_m: float = 0.8  # a measurement joins the wearer's track within this (+ max_speed x time unseen)
+    max_speed_mps: float = 1.2
+    motion_window_s: float = 1.2  # heading = walking direction over this window...
+    min_move_m: float = 0.3  # ...when they moved at least this far; else the facing from pose keypoints
+    facing_conf: float = 0.5
+    center_deg: float = 18.0  # turn the drone when the wearer is this far off-centre
+    replan_m: float = 0.8  # re-plan when the wearer is this far off the path
+    cue_hz: float = 4.0  # repeat the current cue this often (and at once when it changes)
+    lost_turn_s: float = 1.5  # wearer not seen this long: turn toward where they were
+    # closer than ~1 m to the drone the wearer fills the frame's width and cannot be measured: last measured within
+    # the arrival distance + lost_close_m, then unmeasurable for lost_close_s (still walking in) -> arrived
+    lost_close_m: float = 0.7
+    lost_close_s: float = 0.5
+    lost_timeout_s: float = 30.0  # not seen this long: give up (the mission lands)
+    max_s: float = 300.0
 
 
 @dataclass
@@ -261,6 +310,7 @@ class Config:
     follow: FollowCfg = field(default_factory=FollowCfg)
     explore: ExploreCfg = field(default_factory=ExploreCfg)
     approach: ApproachCfg = field(default_factory=ApproachCfg)
+    guide: GuideCfg = field(default_factory=GuideCfg)
     fly: FlyCfg = field(default_factory=FlyCfg)
     safety: SafetyCfg = field(default_factory=SafetyCfg)
     drone: DroneCfg = field(default_factory=DroneCfg)
@@ -354,6 +404,8 @@ def validate(cfg: Config) -> Config:
     for name, sec in (("follow", f), ("approach", cfg.approach)):
         if sec.steering not in ("pid", "fly"):
             raise ValueError(f"{name}.steering must be 'pid' or 'fly', got {sec.steering!r}")
+    if cfg.explore.scan_altitude_m < s.min_altitude_m:
+        raise ValueError("explore.scan_altitude_m is below safety.min_altitude_m")
     if t.max_age_s < t.lost_after_s:
         raise ValueError("tracking.max_age_s must be >= tracking.lost_after_s (else re-locking a returning target fails)")
     return cfg

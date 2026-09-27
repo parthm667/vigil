@@ -126,6 +126,19 @@ def map_panel(ctx, mission, scale: float = 45.0) -> np.ndarray:
     gd = getattr(mission, "guidance", None)
     if gd is not None and gd.person_xy is not None:
         cv2.arrowedLine(img, px(*gd.person_xy), px(*gd.target_xy), (60, 220, 60), 2, tipLength=0.08)
+    # GUIDE: the walking path and the tracked wearer (dot + heading)
+    guide = getattr(mission, "child", None) if getattr(mission, "state", "") == "GUIDE" else None
+    wp = getattr(guide, "path", None)
+    if wp is not None:
+        pts = [px(x, y) for x, y in wp.points]
+        for a, b in zip(pts, pts[1:]):
+            cv2.line(img, a, b, (60, 220, 220), 2)
+        cv2.circle(img, px(*wp.goal), 6, (60, 220, 220), 2)
+    if getattr(guide, "person_xy", None) is not None:
+        (gx, gy), h = guide.person_xy, math.radians(guide.heading)
+        cv2.circle(img, px(gx, gy), 6, COLORS["person"], -1)
+        cv2.arrowedLine(img, px(gx, gy), px(gx + 0.6 * math.cos(h), gy + 0.6 * math.sin(h)), COLORS["person"], 2,
+                        tipLength=0.3)
     # drone
     u, v = px(pose.x, pose.y)
     h = math.radians(pose.heading_deg)
