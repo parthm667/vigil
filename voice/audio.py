@@ -115,6 +115,9 @@ class Recorder:
         blocks: list[np.ndarray] = []
         speaking = False
         quiet_s = 0.0
+        noise = 0.002  # adaptive floor: EMA of the RMS while nobody is talking. The fixed
+        # push-to-talk threshold (silence_rms 0.010) needs a raised voice on the AirPods'
+        # HFP mic; hands-free triggers a factor above the ACTUAL room floor instead.
         with sd.InputStream(samplerate=self.rate, channels=1, dtype="float32",
                             device=idx, blocksize=int(self.rate * 0.05),
                             callback=callback):
@@ -130,7 +133,12 @@ class Recorder:
                     speaking, quiet_s = False, 0.0
                     continue
                 dur = block.size / self.rate
-                loud = float(np.sqrt(np.mean(block**2))) >= self.silence_rms
+                rms = float(np.sqrt(np.mean(block**2)))
+                start_thr = max(3.0 * noise, 0.0035)  # to BEGIN an utterance
+                keep_thr = max(1.6 * noise, 0.0020)  # to CONTINUE one (hysteresis: no mid-word cuts)
+                loud = rms >= (keep_thr if speaking else start_thr)
+                if not speaking and rms < start_thr:
+                    noise += 0.05 * (rms - noise)  # learn the floor only from non-speech
                 if loud:
                     speaking = True
                     quiet_s = 0.0
