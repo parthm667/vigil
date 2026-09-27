@@ -219,6 +219,9 @@ class GuideCfg:
     unknown_top_m: float = 1.0  # the object's top (above the floor) when it was never measured
     look_deg: float = 45.0  # look-back: toward the wearer, then this far to the left and to the right
     settle_s: float = 0.5  # after a rotation/move, before frames count (on top of drone.video_lag_s)
+    pre_turn_hover_s: float = 1.5  # hover still this long on arrival before the look-back turn (momentum -> drift)
+    max_turn_deg: float = 90.0  # look-back turns larger than this go in steps...
+    turn_pause_s: float = 0.8  # ...with a still hover this long between them (like the search's scan)
     view_person_runs: int = 3  # person-detector runs per look-back view...
     view_context_runs: int = 2  # ...and furniture-detector runs
     view_timeout_s: float = 3.0

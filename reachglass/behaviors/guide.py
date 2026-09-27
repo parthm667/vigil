@@ -111,6 +111,9 @@ class Guide(Behavior):
         self.glasses_mode = False
         self.g_arrive = 0
         self.g_seen_t = -math.inf
+        # like the search's scan: hover still before turning (the approach's last move just ended: momentum)
+        self.hold_until = ctx.now + c.pre_turn_hover_s
+        self.partial_turn = False  # a look-back turn split into max_turn_deg steps is under way
         self.phase = "lower"
         cmd = self._lower_cmd(ctx) if c.lower else None
         if cmd is not None:
@@ -149,6 +152,10 @@ class Guide(Behavior):
         if ctx.now - self.t0 > c.max_s:
             self.status = f"guiding took over {c.max_s:.0f} s"
             return FAILURE
+        if ctx.now < self.hold_until:  # hovering still before the next turn step (a queued command waits)
+            ctx.drone.rc(0, 0, 0, 0)
+            self._repeat_cue(ctx)
+            return RUNNING
         if self.cmd is not None:
             r = self.cmd.step(ctx)
             if r == RUNNING:
@@ -163,7 +170,15 @@ class Guide(Behavior):
             if self.phase == "lower":
                 self._begin_look(ctx)
             elif self.phase == "look":
-                self._start_view(ctx)
+                if self.partial_turn and r != FAILURE:
+                    self.partial_turn = False
+                    self.hold_until = ctx.now + c.turn_pause_s  # still hover, then the next step of the turn
+                    self._next_view(ctx)
+                else:
+                    if self.partial_turn:  # a step failed: look from here (as a failed turn always did)
+                        self.partial_turn = False
+                        self.views.pop(0)
+                    self._start_view(ctx)
             elif self.phase == "face":
                 self._start_guiding(ctx)
             return RUNNING
@@ -192,6 +207,10 @@ class Guide(Behavior):
         h = self.views.pop(0)
         self.view_t0 = None
         rot = rotation_to(ctx, h)
+        if abs(rot) > self.c.max_turn_deg:  # a big turn (the 180 back to the wearer) in steps, like the scan
+            self.views.insert(0, h)  # the same heading again after this step
+            self.partial_turn = True
+            rot = math.copysign(self.c.max_turn_deg, rot)
         if abs(rot) >= 3:
             self._issue(ctx, Discrete("rotate", rot), f"look-back: turn {rot:+.0f} deg")
         else:
