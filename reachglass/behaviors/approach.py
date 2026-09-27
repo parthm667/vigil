@@ -2,13 +2,14 @@
 
 The search already located it (semantic memory, from the scans). No re-measuring, no re-searching:
   1. turn to the mapped position
-  2. climb, if needed, to overfly_clearance_m above the target's top (measured when the search confirmed it)
+  2. go to travel_altitude_m (1.5 m) above the floor; re-levelled before every later forward move and on
+     arrival (moves are relative and the Tello drifts, e.g. rising over a table), so it travels and ends there
   3. fly forward distance + overshoot_m (in moves of at most 4 m): the drone ends just past the target
 The target IS a person ("find arthur"): no climb, no fly-over; stop person_standoff_m short of them, and
 their own position does not count as a person in the way.
 A person ahead near that straight path (or where the wearer stood) -> do not go: hover here (SUCCESS).
-A lost reply (timeout: the Tello most likely did it) or a refused climb -> carry on with the plan; a refused
-turn or forward move -> stop there (SUCCESS). No target in memory -> FAILURE.
+A lost reply (timeout: the Tello most likely did it) or a refused height change (safety floor/ceiling) -> carry
+on with the plan; a refused turn or forward move -> stop there (SUCCESS). No target in memory -> FAILURE.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from ..types import TargetObs
 from .base import FAILURE, RUNNING, SUCCESS, Behavior, Ctx, Discrete
 
 MAX_MOVE_M = 4.0  # the Tello's move command takes at most 5 m
+LEVEL = "level"  # plan step: move to travel_altitude_m, computed when it is reached
 
 
 def observe_people(ctx: Ctx) -> None:
@@ -129,19 +131,36 @@ class Approach(Behavior):
             if r == RUNNING:
                 return RUNNING
             failed, self.cmd = self.cmd, None
-            if r == FAILURE and failed.result != "error: timeout" and failed.direction != "up":
+            if r == FAILURE and failed.result != "error: timeout" and failed.direction not in ("up", "down"):
                 self.status = f"stopped short of the {cls} ({failed.result})"
                 return SUCCESS
-        if not self.plan:
-            self.status = f"{'next to' if self.person_target else 'over'} the {cls}"
-            return SUCCESS
-        self.cmd, self.status = self.plan.pop(0)
-        ctx.note(f"approach: {self.status}")
-        return RUNNING
+        while self.plan:
+            item = self.plan.pop(0)
+            if item == LEVEL:
+                item = self._level(ctx)  # computed now, from the altitude now
+                if item is None:
+                    continue  # already within 10 cm of travel_altitude_m
+            self.cmd, self.status = item
+            ctx.note(f"approach: {self.status}")
+            return RUNNING
+        self.status = f"{'next to' if self.person_target else 'over'} the {cls}"
+        return SUCCESS
 
-    def _plan(self, ctx: Ctx, xy: tuple[float, float]) -> list[tuple[Discrete, str]]:
-        """Turn to the mapped target, climb over its top if needed, fly past it (a person: stop short)."""
-        c, cls, pose, alt = self.c, ctx.target_cls, ctx.odom.pose, ctx.altitude
+    def _level(self, ctx: Ctx) -> tuple[Discrete, str] | None:
+        """A move to travel_altitude_m above the floor, or None when already within 10 cm of it. The Tello moves
+        at least 20 cm: 10-20 cm off moves 20 cm, which still ends within 10 cm."""
+        alt, want = ctx.altitude, self.c.travel_altitude_m
+        if alt is None or abs(want - alt) < 0.1:
+            return None
+        up = want > alt
+        cm = max(int(round(self.c.min_step_m * 100)), int(round(abs(want - alt) * 100)))
+        return (Discrete("move", cm, "up" if up else "down"),
+                f"{'climb' if up else 'descend'} {cm} cm to {want:.1f} m for the trip")
+
+    def _plan(self, ctx: Ctx, xy: tuple[float, float]) -> list:
+        """Level at travel_altitude_m, turn to the mapped target, fly past it (a person: stop short); re-level
+        before each later forward move and at the end."""
+        c, cls, pose = self.c, ctx.target_cls, ctx.odom.pose
         b = pose.bearing_to(*xy)
         if self.person_target:
             dist = pose.distance_to(*xy) - c.person_standoff_m
@@ -152,23 +171,18 @@ class Approach(Behavior):
         if self._person_near(ctx, (pose.x, pose.y), end, xy if self.person_target else None):
             self.status = f"a person is between us and the {cls}: staying here"
             return []
-        plan = []
+        plan: list = [LEVEL]
         if abs(b) >= 3:
             plan.append((Discrete("rotate", b), f"turn {b:+.0f} deg to the {cls} on the map"))
-        if not self.person_target and self.last_top is not None and alt is not None:
-            climb = self.last_top + c.overfly_clearance_m - alt
-            room = ctx.cfg.safety.max_altitude_m - 0.1 - alt  # never above the ceiling
-            if climb > 0.05 and room >= c.min_step_m:
-                climb = min(max(climb, c.min_step_m), room)  # the Tello moves at least 20 cm
-                plan.append((Discrete("move", int(round(climb * 100)), "up"), f"climb {climb:.2f} m over the {cls}"))
         if dist >= c.min_step_m:
             n = max(1, math.ceil(dist / MAX_MOVE_M))
             why = (f"fly to {c.person_standoff_m:.1f} m from {cls}" if self.person_target
                    else f"fly to the {cls} and {c.overshoot_m:.1f} m past it")
-            for _ in range(n):
+            for k in range(n):
+                if k:
+                    plan.append(LEVEL)
                 plan.append((Discrete("move", int(round(dist / n * 100)), "forward"), f"{why}: forward {dist / n:.2f} m"))
-        if not plan:
-            self.status = f"already at the {cls}"
+        plan.append(LEVEL)  # and stay at travel_altitude_m once there
         return plan
 
     def _person_near(self, ctx: Ctx, a: tuple[float, float], b: tuple[float, float],

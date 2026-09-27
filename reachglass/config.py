@@ -192,7 +192,7 @@ class ExploreCfg:
 class ApproachCfg:
     standoff_m: float = 1.3  # only a fallback (guidance when the map has no target); the approach flies to the map:
     person_standoff_m: float = 1.5  # stop distance when the target IS a person ("find arthur"): no fly-over
-    overfly_clearance_m: float = 0.5  # climb (if needed) to this far above the object's top...
+    travel_altitude_m: float = 1.5  # height above the floor while flying to the found target (and on arrival)
     overshoot_m: float = 0.2  # ...and fly this far past its estimated position: hover just beyond it
     max_overfly_m: float = 2.5  # longest blind leg (the camera cannot see below once over it)
     tolerance_m: float = 0.25
@@ -436,6 +436,8 @@ def validate(cfg: Config) -> Config:
     for name, sec in (("follow", f), ("approach", cfg.approach)):
         if sec.steering not in ("pid", "fly"):
             raise ValueError(f"{name}.steering must be 'pid' or 'fly', got {sec.steering!r}")
+    if not s.min_altitude_m <= cfg.approach.travel_altitude_m <= s.max_altitude_m - 0.2:
+        raise ValueError("approach.travel_altitude_m must be between safety.min_altitude_m and 0.2 m below the ceiling")
     if cfg.explore.scan_altitude_m < s.min_altitude_m:
         raise ValueError("explore.scan_altitude_m is below safety.min_altitude_m")
     if t.max_age_s < t.lost_after_s:
