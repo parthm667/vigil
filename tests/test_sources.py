@@ -71,7 +71,7 @@ def test_team_videostream_reader_via_tello_source(video):
     import reachglass.sources.video_stream  # noqa: F401
 
     assert "nobuffer" in os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"]
-    src = TelloVideoSource(url=video, fps=60).start()
+    src = TelloVideoSource(url=video, fps=60, backend="opencv").start()
     try:
         f = src.wait_first(5.0)
         assert f is not None and f.source == "tello" and f.seq >= 1
@@ -91,10 +91,11 @@ def test_team_videostream_reader_via_tello_source(video):
 
 @pytest.mark.slow
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
-def test_tello_source_waits_for_a_stream_that_starts_after_the_open_timeout():
+@pytest.mark.parametrize("backend", ["pyav", "opencv"])
+def test_tello_source_waits_for_a_stream_that_starts_after_the_open_timeout(backend):
     # the "can't find camera" bugs: video starting > 5 s after start() raised; keyframes 5 s apart never decoded
     port = 11178
-    src = TelloVideoSource(url=f"udp://@0.0.0.0:{port}").start()  # must not raise
+    src = TelloVideoSource(url=f"udp://@0.0.0.0:{port}", backend=backend).start()  # must not raise
     time.sleep(7.0)
     ff = subprocess.Popen(["ffmpeg", "-loglevel", "quiet", "-re", "-f", "lavfi", "-i", "testsrc=size=960x720:rate=30",
                            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-g", "150",

@@ -205,6 +205,7 @@ class DroneCfg:
     move_speed_cm_s: int = 50  # speed for discrete moves ('speed' command)
     yaw_sign: int = 1  # +1 if telemetry yaw grows with `cw`; auto-checked at the first scan rotation
     video_fps: int = 60  # reader retrieve cap: must sit above the ~30 fps stream (equal drops ~40 % of frames)
+    video_backend: str = "pyav"  # Tello H.264 decoder: pyav (djitellopy's) or opencv (the team's VideoStream)
     # camera-to-laptop video delay (s). After a discrete move/rotation, only frames arriving later than
     # "command done + video_lag_s" show the new view. Measure it with tools/tello_latency_test.py.
     # 2026-09-26 run: video 6 +/- 78 ms (yaw) and 21 +/- 40 ms (forward move) behind telemetry, worst 85 ms

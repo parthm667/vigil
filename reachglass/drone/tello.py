@@ -55,7 +55,7 @@ class TelloDrone(Drone):
     name = "tello"
 
     def __init__(self, tello=None, video: bool = True, dry_run: bool = False, move_speed_cm_s: int = 50,
-                 yaw_sign: int = 1, velocity_scale: float = 0.1, video_fps: int = 60, host: str = "192.168.10.1"):
+                 yaw_sign: int = 1, velocity_scale: float = 0.1, video_fps: int = 60, video_backend: str = "pyav", host: str = "192.168.10.1"):
         """tello: an existing djitellopy.Tello (or a test double); created on connect() if None.
         velocity_scale: state vgx/vgy/vgz -> m/s (the Tello reports dm/s; check with the latency test)."""
         self._tello = tello
@@ -66,6 +66,7 @@ class TelloDrone(Drone):
         self.yaw_sign = yaw_sign
         self.velocity_scale = velocity_scale
         self.video_fps = video_fps
+        self.video_backend = video_backend
         self._pending: _Pending | None = None
         self._result: str | None = "ok"
         self._flying = False
@@ -108,7 +109,7 @@ class TelloDrone(Drone):
             log.warning("no video packets yet (%d/%d), re-sending streamon", i + 1, STREAMON_TRIES)
         else:
             raise RuntimeError(NO_VIDEO.format(port=port))
-        self._source = TelloVideoSource(url, fps=self.video_fps).start()
+        self._source = TelloVideoSource(url, fps=self.video_fps, backend=self.video_backend).start()
 
     def close(self) -> None:
         try:

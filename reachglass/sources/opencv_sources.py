@@ -21,7 +21,8 @@ def _readonly(img: np.ndarray) -> np.ndarray:
 
 
 class TelloVideoSource(FrameSource):
-    """The Tello's H.264 stream via the team's low-latency VideoStream.
+    """The Tello's H.264 stream, decoded by PyAV (backend "pyav", default: djitellopy's decoder) or by the team's
+    OpenCV VideoStream (backend "opencv").
 
     The drone must already have been told `streamon` (the drone adapter does that). Only one reader
     can bind UDP 11111: every consumer shares this source.
@@ -36,8 +37,11 @@ class TelloVideoSource(FrameSource):
 
     name = "tello"
 
-    def __init__(self, url: str = TELLO_UDP_URL, fps: int = 60, timeout_ms: int = 15000, reconnect_after_s: float = 20.0):
-        self.url, self.fps = url, fps
+    def __init__(self, url: str = TELLO_UDP_URL, fps: int = 60, timeout_ms: int = 15000, reconnect_after_s: float = 20.0,
+                 backend: str = "pyav"):
+        if backend not in ("pyav", "opencv"):
+            raise ValueError(f"video backend {backend!r}: use pyav or opencv")
+        self.url, self.fps, self.backend = url, fps, backend
         # FFmpeg open/read timeout. It must outlast the wait for a clean keyframe: nothing decodes before one, and
         # the Tello sends them seconds apart (a lost packet costs a whole one). With 5 s / 3 s the capture was
         # aborted before its first keyframe on a weak link, and a timed-out capture never delivers again.
@@ -58,11 +62,14 @@ class TelloVideoSource(FrameSource):
         return self
 
     def _run(self) -> None:
-        from .video_stream import VideoStream
+        if self.backend == "pyav":
+            from .pyav_stream import PyAVStream as Stream
+        else:
+            from .video_stream import VideoStream as Stream
 
         while not self._stop.is_set():
             try:
-                stream = VideoStream(self.url, fps=self.fps, open_timeout_ms=self.timeout_ms, read_timeout_ms=self.timeout_ms).start()
+                stream = Stream(self.url, fps=self.fps, open_timeout_ms=self.timeout_ms, read_timeout_ms=self.timeout_ms).start()
             except RuntimeError:  # nothing decodable before the open timeout: try again
                 self._stop.wait(0.5)
                 continue

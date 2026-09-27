@@ -111,7 +111,7 @@ class StreamingFakeTello(FakeTello):
 
 
 class StubSource:
-    def __init__(self, url, fps):
+    def __init__(self, url, fps, backend):
         self.url = url
 
     def start(self):

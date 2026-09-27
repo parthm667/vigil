@@ -21,7 +21,7 @@ import cv2
 # stops latency from growing the longer the stream runs.
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    "fflags;nobuffer|flags;low_delay|framedrop;1",
+    "fflags;nobuffer|flags;low_delay|framedrop;1|probesize;10000000|analyzeduration;12000000",
 )
 
 
