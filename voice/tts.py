@@ -50,14 +50,39 @@ def _decode_mp3(data: bytes):
 
 
 def _speak_sapi(text: str) -> None:
-    """Offline fallback. A fresh engine per utterance dodges pyttsx3's stale-loop bugs."""
+    """Offline fallback. Renders to a wav and plays it through the routed output device:
+    engine.say() goes to the Windows DEFAULT device, which is a silent A2DP endpoint while
+    the hands-free mic holds the AirPods in HFP. A fresh engine per utterance dodges
+    pyttsx3's stale-loop bugs."""
+    import os
+    import tempfile
+    import wave
+
+    import numpy as np
     import pyttsx3
+    import sounddevice as sd
+
+    from .audio import find_output_device
 
     engine = pyttsx3.init()
     engine.setProperty("rate", 185)
-    engine.say(text)
-    engine.runAndWait()
-    engine.stop()
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        engine.save_to_file(text, path)
+        engine.runAndWait()
+        engine.stop()
+        with wave.open(path, "rb") as w:
+            rate, n = w.getframerate(), w.getnframes()
+            data = np.frombuffer(w.readframes(n), dtype=np.int16).astype(np.float32) / 32768.0
+            if w.getnchannels() == 2:
+                data = data.reshape(-1, 2).mean(axis=1)
+        sd.play(data, rate, device=find_output_device(), blocking=True)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 class Speaker:
@@ -136,8 +161,10 @@ class Speaker:
             try:
                 import sounddevice as sd
 
+                from .audio import find_output_device
+
                 data, rate = _decode_mp3(_synth_edge(text, self.voice))
-                sd.play(data, rate, blocking=True)
+                sd.play(data, rate, device=find_output_device(), blocking=True)
                 return
             except Exception as e:
                 print(f"[tts] edge failed ({type(e).__name__}), falling back to SAPI")

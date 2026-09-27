@@ -17,6 +17,20 @@ import time
 import numpy as np
 
 
+def find_output_device(substr: str = "AirPods") -> int | None:
+    """Index of the first OUTPUT device whose name contains substr, or None (system default).
+    While the hands-free mic holds the AirPods in HFP, the 'Stereo' endpoint is silent and
+    Windows' default output may still point at it -- play through the matched (headset)
+    endpoint explicitly, or nothing is heard."""
+    import sounddevice as sd
+
+    want = substr.lower()
+    for i, dev in enumerate(sd.query_devices()):
+        if dev["max_output_channels"] > 0 and want in dev["name"].lower():
+            return i
+    return None
+
+
 def find_input_device(substr: str) -> tuple[int | None, str]:
     """Index and name of the first input device whose name contains substr
     (case-insensitive), or (None, <default device name>) to use the default mic."""

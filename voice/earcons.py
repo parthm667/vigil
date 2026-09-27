@@ -40,8 +40,13 @@ def error_buzz() -> tuple[np.ndarray, int]:
 
 
 def play(sound: tuple[np.ndarray, int], device=None) -> None:
-    """Blocking playback on the default (or given) output device."""
+    """Blocking playback. device None = the AirPods' live output endpoint if present, else
+    the system default (the default may be a silent A2DP endpoint while the mic holds HFP)."""
     import sounddevice as sd
 
+    if device is None:
+        from .audio import find_output_device
+
+        device = find_output_device()
     data, rate = sound
     sd.play(data, rate, device=device, blocking=True)
