@@ -1,16 +1,17 @@
 """Mission state machine.
 
     TAKEOFF -> CLIMB -> FOLLOW --(query "find X")--> DESCEND (to explore.scan_altitude_m) -> EXPLORE -> APPROACH -> ARRIVED (hovering just past the object)
-    (the search starts at the follow altitude: no descent)      -> GUIDE (look back, walking path, cues) -> LAND
+                                                                -> GUIDE (look back, walking path, cues) -> DONE
                           ^                                      |            |          |
                           +------------- REACQUIRE <--------------+-(failed)---+---(query "follow me")
     any state: "land" -> LAND -> LANDED;  "stop"/"cancel" -> REACQUIRE (back to following)
+    DONE: guided there; hovers in place with all sensing off until "land" (or "follow me" / a new "find")
 
 When the query arrives the mission frame is reset at the drone (x = its heading), and the person's
 position and facing are recorded: that is what the guidance (turn / distance for the person) is
 computed against once the target is reached. announce() is the audio hook (printed for now).
 GUIDE (behaviors/guide.py) then walks the wearer to the target: cue() gets -1 (turn left) / 0 (forward) /
-+1 (turn right) continuously and 2 on arrival (printed for now; the glasses' hook), then the drone lands.
++1 (turn right) continuously and 2 on arrival (glasses.HapticCues: pads + speech), then DONE (hovering).
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from .guidance import Guidance, clock_face, compute_guidance, direction_words
 
 log = logging.getLogger("reachglass.mission")
 
-STATES = ("IDLE", "TAKEOFF", "CLIMB", "FOLLOW", "DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "GUIDE", "REACQUIRE", "HOLD",
+STATES = ("IDLE", "TAKEOFF", "CLIMB", "FOLLOW", "DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "GUIDE", "DONE", "REACQUIRE", "HOLD",
           "LAND", "LANDED")
 
 
@@ -133,6 +134,8 @@ class Mission:
             prev = self._resume_state
             if prev == "GUIDE" and self._guide_target is not None:
                 self._go("GUIDE", "resume guiding", self._new_guide())
+            elif prev == "DONE":
+                self._go("DONE", "resume: finished, hovering")  # never restart following after a pause at the end
             elif prev in ("DESCEND", "EXPLORE", "APPROACH", "ARRIVED") and self.ctx.target_cls:
                 self._go("DESCEND", "resume search")
             else:
@@ -155,13 +158,13 @@ class Mission:
         if q.intent == "land":
             self._land("asked to land")
         elif q.intent == "cancel":
-            if self.state in ("DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "GUIDE", "HOLD"):
+            if self.state in ("DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "GUIDE", "DONE", "HOLD"):
                 self.ctx.drone.stop()
                 self.announce("Okay, stopping. Coming back to you.")
                 self._reacquire("cancelled")
         elif q.intent == "follow":
             lost = self.ctx.res is None or self.ctx.res.person_unseen_s > 2.0
-            if self.state in ("DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "GUIDE", "HOLD") or (self.state == "FOLLOW" and lost):
+            if self.state in ("DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "GUIDE", "DONE", "HOLD") or (self.state == "FOLLOW" and lost):
                 self.ctx.drone.stop()
                 self.announce("Coming back to you." if self.state != "FOLLOW" else "Looking for you.")
                 self._reacquire("asked to follow")
@@ -178,7 +181,7 @@ class Mission:
             if self.state == "ARRIVED" and q.target == self.ctx.target_cls and self.guidance is not None:
                 self._refresh_guidance()  # a repeat updates the cues, it must not restart the search
                 return
-            if self.state in ("FOLLOW", "ARRIVED", "GUIDE", "HOLD", "REACQUIRE", "DESCEND", "EXPLORE", "APPROACH"):
+            if self.state in ("FOLLOW", "ARRIVED", "GUIDE", "DONE", "HOLD", "REACQUIRE", "DESCEND", "EXPLORE", "APPROACH"):
                 self.ctx.drone.stop()
                 self._begin_search(q.target)
             elif self.state in ("TAKEOFF", "CLIMB"):
@@ -365,10 +368,13 @@ class Mission:
             r = self.child.step(ctx)
             if r == SUCCESS:
                 self.announce(f"You made it. {self._the(ctx.target_cls).capitalize()} is right in front of you.")
-                self._land(f"guided to the {ctx.target_cls}: {self.child.status}")
+                ctx.perception.set_mode("idle")  # all sensing done: no detector runs any more
+                self._go("DONE", f"guided to the {ctx.target_cls}: {self.child.status}")
             elif r == FAILURE:
                 self.announce(f"I can't guide you any more ({self.child.status}).")
                 self._land(f"guide failed: {self.child.status}")
+        elif st == "DONE":
+            d.rc(0, 0, 0, 0)  # finished: hover in place, sensing off, until told (land / follow me / find)
         elif st == "REACQUIRE":
             self._step_reacquire()
         elif st == "HOLD":

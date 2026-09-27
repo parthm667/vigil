@@ -3,8 +3,8 @@
 The mission's cue_fn gets -1 (turn left) / 0 (walk forward) / +1 (turn right) / 2 (arrived).
 HapticCues forwards each cue to the Nano over GlassesLink.direction() -- the firmware crosses
 sides on purpose (+1 "go right" presses the LEFT pad, a nudge from the far side pushing the
-wearer the way they should go; see firmware/HARDWARE_INTERFACE.md section 4.1) -- and 2 becomes
-a double buzz on both pads. Cue CHANGES are also spoken through the announce channel (the voice
+wearer the way they should go; see firmware/HARDWARE_INTERFACE.md section 4.1) -- 0 releases both,
+and 2 (arrived, guiding over) releases both for good. Cue CHANGES are also spoken through the announce channel (the voice
 app's TTS); the once-a-second repeats of the same cue are not, so the wearer is not nagged.
 
 The firmware module (firmware/host/reachglass_glasses.py) is imported read-only from its own
@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import math
+import sys
 import threading
 from pathlib import Path
 from typing import Callable
@@ -32,11 +33,20 @@ SPOKEN = {-1: "Turn left.", 0: "Walk forward.", 1: "Turn right.",
 
 
 def _firmware():
-    """firmware/host/reachglass_glasses.py (imported from its file; firmware is read-only)."""
+    """firmware/host/reachglass_glasses.py (imported from its file, once; firmware is read-only). It must be in
+    sys.modules while it executes: its @dataclass looks its own module up there (without it the import raises,
+    which HapticCues used to swallow as "glasses unavailable")."""
+    if "reachglass_glasses" in sys.modules:
+        return sys.modules["reachglass_glasses"]
     path = Path(__file__).resolve().parents[1] / "firmware" / "host" / "reachglass_glasses.py"
     spec = importlib.util.spec_from_file_location("reachglass_glasses", path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    sys.modules["reachglass_glasses"] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        del sys.modules["reachglass_glasses"]
+        raise
     return mod
 
 
@@ -117,10 +127,9 @@ class HapticCues:
         if self.link is not None:
             try:
                 if cue == 2:
-                    self.link.release()
-                    self.link.pulse("B", count=2)  # arrived: a buzz on both pads, not a direction
+                    self.link.release()  # arrived: both pads off the face, and they stay off (guiding is over)
                 else:
-                    self.link.direction(cue)
+                    self.link.direction(cue)  # -1 presses the RIGHT pad, +1 the LEFT, 0 releases both
             except Exception as e:  # noqa: BLE001
                 if not self._warned:
                     self._warned = True

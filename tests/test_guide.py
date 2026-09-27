@@ -46,7 +46,7 @@ def test_cues_left_right_forward():
 
 
 @pytest.mark.slow
-def test_whole_pipeline_guides_the_wearer_to_the_bottle_then_lands():
+def test_whole_pipeline_guides_the_wearer_to_the_bottle_then_hovers_until_told():
     inbox = ScriptedInbox([(26.0, "can you find my water bottle")])
     r = SimRunner(load_config(), inbox=inbox, seed=0)
     r.run(260.0, until=lambda rr: rr.mission.state in ("GUIDE", "REACQUIRE", "HOLD", "LANDED"))
@@ -65,8 +65,12 @@ def test_whole_pipeline_guides_the_wearer_to_the_bottle_then_lands():
             person.x += v * math.cos(h) * r.dt
             person.y += v * math.sin(h) * r.dt
             assert not any(b.contains((person.x, person.y, 0.5), margin=0.1) for b in furniture), r.ctx.notes[-6:]
-    r.run(15.0, until=lambda rr: rr.mission.state == "LANDED")
     cues = [c for _, c in r.mission.cues]
+    assert r.mission.state == "DONE" and r.sim.drone.flying, r.ctx.notes[-10:]  # finished: hovering, sensing off
+    r.run(3.0)
+    assert r.mission.state == "DONE" and r.sim.drone.flying
+    r.mission.query("land")
+    r.run(15.0, until=lambda rr: rr.mission.state == "LANDED")
     assert r.mission.state == "LANDED" and not r.sim.drone.flying, r.ctx.notes[-10:]
     assert cues[-1] == 2 and cues.count(2) == 1 and set(cues[:-1]) <= {-1, 0, 1}
     assert math.hypot(person.x - TARGET[0], person.y - TARGET[1]) < 1.6  # at the table, next to the bottle
