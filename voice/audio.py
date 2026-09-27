@@ -125,13 +125,19 @@ class Recorder:
                 if tick is not None:
                     tick()
                 try:
-                    block = q.get(timeout=0.5)
+                    pending = [q.get(timeout=0.5)]
                 except queue.Empty:
                     continue
+                while True:  # drain: if tick() ever runs long, catch up instead of lagging behind
+                    try:
+                        pending.append(q.get_nowait())
+                    except queue.Empty:
+                        break
                 if paused is not None and paused():
                     blocks.clear()  # our own TTS (or its tail): never an utterance
                     speaking, quiet_s = False, 0.0
                     continue
+                block = np.concatenate(pending) if len(pending) > 1 else pending[0]
                 dur = block.size / self.rate
                 rms = float(np.sqrt(np.mean(block**2)))
                 start_thr = max(3.0 * noise, 0.0035)  # to BEGIN an utterance
