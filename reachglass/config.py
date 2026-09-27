@@ -115,6 +115,11 @@ class PerceptionCfg:
     # telemetry pitch sign so that nose-up is positive; 0 = do not use pitch (until checked on the drone)
     pitch_sign: int = 0
     target_range_m: tuple = (0.2, 8.0)  # plausible distances for a single-frame target confirmation
+    # Face identification: "find arthur" for photos enrolled in people/ (tools/enroll_faces.py).
+    # Only built when that folder has photos, so this default is dormant out of the box.
+    # kind "" disables entirely; kind "opencv" is the no-pip fallback (YuNet+SFace, threshold ~0.363).
+    face_identifier: ComponentSpec = field(default_factory=lambda: ComponentSpec("insightface", {
+        "people_dir": "people", "match_threshold": 0.40, "reject_threshold": 0.20}))
 
 
 @dataclass
@@ -178,12 +183,15 @@ class ExploreCfg:
         "cup": {"dining table": 1.0, "desk": 1.0, "sink": 0.8, "microwave": 0.5},
         "backpack": {"chair": 0.8, "bed": 0.8, "couch": 0.6, "dining table": 0.4},
         "laptop": {"dining table": 1.0, "desk": 1.0, "couch": 0.5, "bed": 0.4},
+        # any enrolled person's name ("find arthur"): where people tend to be
+        "_person": {"chair": 0.8, "couch": 0.8, "bench": 0.5, "dining table": 0.5, "bed": 0.4},
     })
 
 
 @dataclass
 class ApproachCfg:
     standoff_m: float = 1.3  # last measurement this far from the target, then the fly-over:
+    person_standoff_m: float = 1.5  # stop distance when the target IS a person ("find arthur"): no fly-over
     overfly_clearance_m: float = 0.5  # climb (if needed) to this far above the object's top...
     overshoot_m: float = 0.2  # ...and fly this far past its estimated position: hover just beyond it
     max_overfly_m: float = 2.5  # longest blind leg (the camera cannot see below once over it)
@@ -408,6 +416,9 @@ def validate(cfg: Config) -> Config:
         raise ValueError("explore.scan_altitude_m is below safety.min_altitude_m")
     if t.max_age_s < t.lost_after_s:
         raise ValueError("tracking.max_age_s must be >= tracking.lost_after_s (else re-locking a returning target fails)")
+    fi = p.face_identifier
+    if fi.kind and fi.params.get("reject_threshold", 0.0) >= fi.params.get("match_threshold", 1.0):
+        raise ValueError("perception.face_identifier: reject_threshold must be below match_threshold")
     return cfg
 
 

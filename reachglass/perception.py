@@ -14,6 +14,8 @@ Detectors per role, each swappable in config:
 from __future__ import annotations
 
 import time
+from dataclasses import replace
+from pathlib import Path
 
 from .config import Config
 from .detect import DETECTORS, Detector
@@ -28,10 +30,11 @@ MIN_WIDTH_PX = 25  # below this a width-based range is too coarse and blur-infla
 
 class Perception:
     def __init__(self, cfg: Config, person: Detector | None = None, target: Detector | None = None,
-                 context: Detector | None = None, camera: CameraModel | None = None):
+                 context: Detector | None = None, camera: CameraModel | None = None, identifier=None):
         self.cfg = cfg
         pc, tc = cfg.perception, cfg.tracking
         self.detectors = {"person": person, "target": target, "context": context}
+        self.identifier = identifier  # FaceIdentifier: who a person is ("find arthur"), None = off
         self.camera = camera or camera_from_config(cfg.camera)
         self.tracker = SimpleTracker(tc.iou_match, tc.center_match_frac, tc.max_age_s)
         self.person_lock = TargetLock(self.tracker, tc.confirm_hits, tc.confirm_window, 0.99, tc.lost_after_s, select=largest)
@@ -47,6 +50,7 @@ class Perception:
         self.target_cls: str | None = None
         self._frame_i = 0
         self._mode_i = 0
+        self._name_seen_t = -1e9  # last time the enrolled target person was identified
         self._cam_for: CameraModel = self.camera
         self.last: PerceptionResult | None = None
 
@@ -54,7 +58,21 @@ class Perception:
     def from_config(cls, cfg: Config, camera: CameraModel | None = None) -> Perception:
         pc = cfg.perception
         return cls(cfg, DETECTORS.build(pc.person_detector), DETECTORS.build(pc.target_detector),
-                   DETECTORS.build(pc.context_detector), camera)
+                   DETECTORS.build(pc.context_detector), camera, cls._identifier_from(pc))
+
+    @staticmethod
+    def _identifier_from(pc):
+        """The face identifier, or None when disabled or nobody is enrolled (the
+        insightface import and model load are only paid when photos exist)."""
+        spec = pc.face_identifier
+        if not spec.kind:
+            return None
+        d = Path(spec.params.get("people_dir", "people"))
+        if not d.is_dir() or not any(p.suffix.lower() in (".jpg", ".jpeg", ".png") for p in d.iterdir()):
+            return None
+        from .person.identify import FACE_IDENTIFIERS  # heavy import only when used
+
+        return FACE_IDENTIFIERS.build(spec)
 
     # ------------------------------------------------------------------ control
     def set_mode(self, mode: str) -> None:
@@ -69,20 +87,33 @@ class Perception:
         self.target_lock.set_class(cls)
 
     def vocabulary(self) -> list[str]:
-        """Classes a user may ask for: everything the target and context detectors know (not people)."""
+        """Classes a user may ask for: everything the target and context detectors know (not the generic
+        "person"), plus every enrolled name when face identification is on."""
         names = set()
         for role in ("target", "context"):
             d = self.detectors[role]
             if d is not None:
                 names.update(d.classes)
         names.discard("person")
+        if self.identifier is not None:
+            names.update(self.identifier.names)
         return sorted(names)
+
+    def is_name(self, cls: str | None) -> bool:
+        """Is this an enrolled person's name rather than an object class?"""
+        return self.identifier is not None and cls in self.identifier.names
+
+    def name_target(self) -> bool:
+        """Is the current target an enrolled person ("arthur") rather than an object class?"""
+        return self.is_name(self.target_cls)
 
     def reset_tracks(self) -> None:
         """After a big discontinuity (e.g. a 45 deg rotation) old boxes cannot be associated anyway."""
         self.tracker.reset()
         self.person_lock.release()
         self.target_lock.release()
+        if self.identifier is not None:
+            self.identifier.reset_tracks()
 
     # ------------------------------------------------------------------ helpers
     def _plausible_target(self, det: Detection) -> bool:
@@ -105,6 +136,8 @@ class Perception:
         """Which detector role reports this class (the target detector first)."""
         if cls is None:
             return None
+        if self.identifier is not None and cls in self.identifier.names:
+            return "person"  # a name rides on person detections (identified on their crops)
         for role in ("target", "context", "person"):
             d = self.detectors[role]
             if d is not None and cls in d.classes:
@@ -159,6 +192,8 @@ class Perception:
         """Run this detector every Nth frame in the current mode (0 = never)."""
         if self.detectors[role] is None:
             return 0
+        if role == "target" and self.name_target():
+            return 0  # searching for a person by name: the object detector has nothing to contribute
         strides = self.cfg.perception.stride.get(self.mode, {})
         stride = strides.get(role, 0)
         if self.mode in ("search", "approach") and role == self.owner_of(self.target_cls):
@@ -216,7 +251,29 @@ class Perception:
                 res.person = next((p for p in res.persons if p.det.track_id == ps.det.track_id), None)
         owner = self.owner_of(self.target_cls) or "target"
         res.target_ran = ran.get(owner, False) or self.detectors.get(owner) is None
-        if self.target_cls:
+        if self.target_cls and self.name_target():
+            # "find arthur": identity rides on person crops; a face match (or a provisional
+            # inheritance right after a tracker reset) is stronger evidence than the 3-of-5
+            # lock, so the TargetLock is bypassed entirely for name targets.
+            if persons and ran["person"]:
+                matches = self.identifier.identify(frame.image, persons, frame.t)
+                best = None
+                for p, m in zip(res.persons, matches):
+                    if m is None:
+                        continue
+                    p.name, p.name_sim = m.name, m.sim
+                    if m.name == self.target_cls and (best is None or m.sim > best[1].sim):
+                        best = (p, m)
+                if best is not None:
+                    p, m = best
+                    det = replace(p.det, cls=self.target_cls)  # a copy: the tracker keeps "person"
+                    tob = TargetObs(det, p.bearing_deg, p.elevation_deg,
+                                    p.range_m if p.range_m is not None else p.range_lo_m, p.range_src or "person")
+                    tob.confirmed = True
+                    res.target = tob
+                    res.targets.append(tob)
+                    self._name_seen_t = frame.t
+        elif self.target_cls:
             ts = self.target_lock.update(dets, frame.t, (frame.width, frame.height), ran=ran.get(owner, False))
             for d in dets:
                 if d.cls == self.target_cls:
@@ -229,7 +286,12 @@ class Perception:
         res.context = [self._object_obs(d, cam, pitch, altitude) for d in dets if d.cls not in ("person", self.target_cls)]
         res.ran = ran
         res.person_unseen_s = self.person_lock.unseen_s(frame.t)
-        res.target_unseen_s = self.target_lock.unseen_s(frame.t) if self.target_cls else float("inf")
+        if not self.target_cls:
+            res.target_unseen_s = float("inf")
+        elif self.name_target():
+            res.target_unseen_s = frame.t - self._name_seen_t
+        else:
+            res.target_unseen_s = self.target_lock.unseen_s(frame.t)
         res.latency_ms = 1000.0 * (time.perf_counter() - t0)
         self._mode_i += 1
         self.last = res

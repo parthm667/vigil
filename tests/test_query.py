@@ -103,3 +103,23 @@ def test_llm_prompt_contains_vocabulary():
 
 def test_registry():
     assert isinstance(QUERY_PARSERS.build("keyword"), KeywordQueryParser)
+
+
+# ------------------------------------------------------------------ enrolled names ("find arthur")
+def test_enrolled_name_parses_as_find_target():
+    p = KeywordQueryParser()
+    vocab = ["bottle", "chair", "arthur"]
+    q = p.parse("find arthur", vocab)
+    assert (q.intent, q.target) == ("find", "arthur")
+    q = p.parse("Where's Arthur?", vocab)
+    assert (q.intent, q.target) == ("find", "arthur")
+    q = p.parse("help me find the person named arthur", vocab)
+    assert (q.intent, q.target) == ("find", "arthur")
+    # names not enrolled stay unknown
+    q = p.parse("find nathan", vocab)
+    assert q.intent == "find" and q.target is None
+    # the thing named after the find verb wins
+    q = p.parse("forget arthur, find my bottle", vocab)
+    assert q.target == "bottle"
+    q = p.parse("forget the bottle, find arthur", vocab)
+    assert q.target == "arthur"

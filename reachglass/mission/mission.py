@@ -24,7 +24,7 @@ from ..behaviors import (FAILURE, RUNNING, SUCCESS, Approach, Behavior, Ctx, Dis
 from ..mapping import Grid, SemanticMemory
 from ..query import ParsedQuery, QueryParser
 from ..types import wrap_deg
-from .guidance import Guidance, compute_guidance
+from .guidance import Guidance, clock_face, compute_guidance, direction_words
 
 log = logging.getLogger("reachglass.mission")
 
@@ -72,6 +72,17 @@ class Mission:
         self.said.append((self.ctx.now, text))
         if self.ctx.cfg.mission.announce:
             self.announce_fn(text)
+
+    def _is_name(self, cls: str | None) -> bool:
+        """Is the target an enrolled person ("arthur") rather than an object class?"""
+        is_name = getattr(self.ctx.perception, "is_name", None)
+        return bool(cls and is_name and is_name(cls))
+
+    def _the(self, cls: str) -> str:
+        return cls.capitalize() if self._is_name(cls) else f"the {cls}"
+
+    def _your(self, cls: str) -> str:
+        return cls.capitalize() if self._is_name(cls) else f"your {cls}"
 
     def _go(self, state: str, why: str = "", child: Behavior | None = None) -> None:
         self.state, self.state_t = state, self.ctx.now
@@ -162,7 +173,10 @@ class Mission:
                 self.announce(f"Sorry, I can't look for {what} yet. I can look for: {', '.join(vocab[:8])}.")
                 return
             if self.state in ("DESCEND", "EXPLORE", "APPROACH") and q.target == self.ctx.target_cls:
-                self.announce(f"Still looking for your {q.target}.")  # a repeat must not restart the search
+                self.announce(f"Still looking for {self._your(q.target)}.")  # a repeat must not restart the search
+                return
+            if self.state == "ARRIVED" and q.target == self.ctx.target_cls and self.guidance is not None:
+                self._refresh_guidance()  # a repeat updates the cues, it must not restart the search
                 return
             if self.state in ("FOLLOW", "ARRIVED", "GUIDE", "HOLD", "REACQUIRE", "DESCEND", "EXPLORE", "APPROACH"):
                 self.ctx.drone.stop()
@@ -207,8 +221,30 @@ class Mission:
                 ctx.person_heading = wrap_deg(ctx.odom.pose.heading_deg + p.bearing_deg + facing)
         self.guidance = None
         self._guide_target, self._guide_top = None, None
-        self.announce(f"Looking for your {target}.")
+        self.announce(f"Looking for {self._your(target)}.")
         self._go("DESCEND", f"search for {target}")
+
+    def _refresh_guidance(self) -> None:
+        """Re-announce where the target is, from the person's CURRENT position and
+        facing if they were seen in the last 2 s (they are walking toward it), else
+        the original guidance sentence. Voice double-press lands here via a repeated
+        'find X' while ARRIVED."""
+        ctx, g = self.ctx, self.guidance
+        p = ctx.last_person if ctx.now - ctx.last_person_t <= 2.0 else None
+        if p is not None and p.range_m is not None:
+            x, y = ctx.odom.pose.point_at(p.range_m, p.bearing_deg)
+            facing = self._smoothed_facing(p)
+            heading = None if facing is None else wrap_deg(ctx.odom.pose.heading_deg + p.bearing_deg + facing)
+            dist, turn = g.relative_to(x, y, heading)
+            meters = f"about {dist:.0f} meters" if dist >= 1.5 else "about a meter"
+            who = g.target_cls.capitalize() if g.person else f"The {g.target_cls}"
+            if turn is None:
+                tail = "" if g.person else " I'm hovering next to it."
+                self.announce(f"{who} is {meters} away.{tail}")
+            else:
+                self.announce(f"{meters.capitalize()} away, {direction_words(turn)} ({clock_face(turn)}).")
+        else:
+            self.announce(g.text)
 
     def _smoothed_facing(self, p) -> float | None:
         """The follow behaviour's circular mean of recent confident facings, else this frame's if confident."""
@@ -286,10 +322,15 @@ class Mission:
         elif st == "EXPLORE":
             r = self.child.step(ctx)
             if r == SUCCESS:
-                self.announce(f"I see the {ctx.target_cls}. Going there.")
-                self._go("APPROACH", self.child.status, Approach(cfg.approach, min_altitude_m=cfg.safety.min_altitude_m))
+                if self._is_name(ctx.target_cls):
+                    # a person target: announce where they are, never fly at a human
+                    self._arrived(self.child.status)
+                else:
+                    self.announce(f"I see {self._the(ctx.target_cls)}. Going there.")
+                    self._go("APPROACH", self.child.status,
+                             Approach(cfg.approach, min_altitude_m=cfg.safety.min_altitude_m))
             elif r == FAILURE:
-                self.announce(f"I couldn't find the {ctx.target_cls}. Coming back to you.")
+                self.announce(f"I couldn't find {self._the(ctx.target_cls)}. Coming back to you.")
                 self._reacquire(self.child.status)
         elif st == "APPROACH":
             r = self.child.step(ctx)
@@ -306,11 +347,11 @@ class Mission:
                     self._approach_retries = 0
                     far = ctx.odom.pose.distance_to(*obj.xy) > cfg.approach.standoff_m + 1.5
                     if far:
-                        self.announce(f"I saw the {ctx.target_cls} but couldn't get close to it.")
+                        self.announce(f"I saw {self._the(ctx.target_cls)} but couldn't get close.")
                     self._arrived(f"approach failed ({self.child.status}); using memory")
                 else:
                     self._approach_retries = 0
-                    self.announce(f"I lost the {ctx.target_cls}. Coming back to you.")
+                    self.announce(f"I lost {self._the(ctx.target_cls)}. Coming back to you.")
                     self._reacquire(self.child.status)
         elif st == "ARRIVED":
             d.rc(0, 0, 0, 0)  # hover next to the target as a beacon (keep-alive)
@@ -319,7 +360,7 @@ class Mission:
         elif st == "GUIDE":
             r = self.child.step(ctx)
             if r == SUCCESS:
-                self.announce(f"You made it. Your {ctx.target_cls} is right in front of you.")
+                self.announce(f"You made it. {self._the(ctx.target_cls).capitalize()} is right in front of you.")
                 self._land(f"guided to the {ctx.target_cls}: {self.child.status}")
             elif r == FAILURE:
                 self.announce(f"I can't guide you any more ({self.child.status}).")
@@ -343,7 +384,8 @@ class Mission:
         ctx = self.ctx
         obj = ctx.memory.best(ctx.target_cls, confirmed_only=False)
         target_xy = obj.xy if obj is not None else ctx.odom.pose.point_at(ctx.cfg.approach.standoff_m, 0.0)
-        self.guidance = compute_guidance(ctx.target_cls, target_xy, ctx.person_origin, ctx.person_heading)
+        self.guidance = compute_guidance(ctx.target_cls, target_xy, ctx.person_origin, ctx.person_heading,
+                                         person=self._is_name(ctx.target_cls))
         self.announce(self.guidance.text)
         self._guide_target = target_xy
         self._guide_top = getattr(self.child, "last_top", None)  # the object's top, measured by the approach

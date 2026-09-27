@@ -98,11 +98,14 @@ class KeywordQueryParser(QueryParser):
         phrases = [(p, cls) for cls, ps in self.synonyms.items() for p in ps]
         self._phrases = sorted(phrases, key=lambda x: -len(x[0]))
 
-    def _mentioned(self, t: str) -> list[tuple[int, str, str]]:
+    def _mentioned(self, t: str, extra: list[tuple[str, str]] = ()) -> list[tuple[int, str, str]]:
         """(position, class, phrase) for every class phrase in the text, longest phrases win overlaps."""
+        phrases = self._phrases
+        if extra:
+            phrases = sorted(list(self._phrases) + list(extra), key=lambda x: -len(x[0]))
         taken = [False] * len(t)
         found = []
-        for phrase, cls in self._phrases:
+        for phrase, cls in phrases:
             for m in re.finditer(r"\b" + re.escape(phrase) + r"\b", t):
                 if not any(taken[m.start():m.end()]):
                     for i in range(m.start(), m.end()):
@@ -116,7 +119,10 @@ class KeywordQueryParser(QueryParser):
         if not t:
             return ParsedQuery(text, "unknown", reason="empty")
         hits = {name for name, pat in INTENT_PATTERNS if re.search(pat, t)}
-        mentioned = self._mentioned(t)
+        # vocabulary entries with no synonym list (enrolled people's names, rare classes) match literally,
+        # so "find arthur" works as soon as arthur.jpg is enrolled
+        extra = [(v, v) for v in vocab if v not in self.synonyms]
+        mentioned = self._mentioned(t, extra)
         detectable = [m for m in mentioned if m[1] in vocab]
         # priority: land > find (a detectable object named with a find verb) > cancel > describe > follow > find
         if "land" in hits:

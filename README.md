@@ -85,9 +85,24 @@ follow: {altitude_m: 2.0, distance_m: 1.0}
 safety: {max_altitude_m: 2.3}           # below your ceiling
 ```
 
-## 4. Sending requests from the voice app
+## 4. The voice app (AirPods Pro 2 on Windows 11)
 
-Every line typed in the terminal is a request. The STT/voice team can also send UTF-8 UDP datagrams to
+```
+.venv\Scripts\pip install -r requirements-voice.txt    # once, separate from the flight deps
+python -m voice --selftest        # FIRST, with the AirPods in: devices, stem press, record, STT, TTS
+python -m voice                   # the real thing, next to `python -m reachglass ...`
+```
+Press an AirPod **stem once** = push-to-talk (chirp -> speak -> blip), **twice** = repeat/refresh the
+guidance, **three times** = "stop". In the voice terminal, Enter / `r` / `s` do the same (the fallback if
+the media-session capture misbehaves). Announcements come back as TTS in the AirPods: the flight app
+publishes everything it says to UDP `--announce-udp` (default 5006) and the voice app speaks it.
+How it works: stem presses arrive as Bluetooth AVRCP media commands captured via a pinned Windows media
+session (`voice/stem.py`); the mic capture stream is opened ONLY while recording, because an open mic
+locks the AirPods into the low-quality HFP profile (`voice/audio.py`); STT is local faster-whisper;
+TTS is edge-tts with offline SAPI fallback. Wiring test without any audio hardware:
+`python -m voice --text "find my water bottle"` against a running sim.
+
+Every line typed in the app terminal is still a request, and anything else can send UTF-8 UDP datagrams to
 port 5005:
 ```python
 import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"find my water bottle", ("127.0.0.1", 5005))
@@ -96,6 +111,21 @@ Requests are parsed to a **constrained** intent and target. The target is always
 actually find, so an unknown object gets "I can't look for keys yet" instead of an invented one.
 `query.LLMQueryParser` plugs in any language model (Grok, etc.) behind the same interface and rejects
 answers outside the vocabulary.
+
+## 4b. Finding people by name ("find arthur")
+
+One photo per teammate in `people/` (`arthur.jpg` -> the drone knows "arthur"), then:
+```
+pip install onnxruntime insightface   # community cp312 wheel if the sdist build fails
+python tools/enroll_faces.py          # embeddings + pairwise-confusability check (no training)
+python tools/face_id_webcam.py        # go/no-go: names overlaid on the webcam, walk back to 3-4 m
+```
+"Find arthur" then runs the same explore/search as the bottle, hopping TOWARD unidentified people
+(stopping `person_clearance_m` short) until a face match confirms them; the drone **never approaches a
+person** -- on identification it announces where they are ("Arthur is about 4 meters away, ahead to your
+left") and hovers. Identity is verified on person-box crops (insightface SCRFD+ArcFace; `kind: opencv`
+in `site.yaml` is the zero-install fallback) and sticks to the track between checks. Faces are readable
+to roughly 3.5-4 m through the Tello camera -- have people face the drone in the demo.
 
 ## 5. Switching the bottle detector
 

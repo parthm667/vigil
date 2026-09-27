@@ -51,6 +51,7 @@ class Guidance:
     distance_m: float | None
     turn_deg: float | None  # + = the person turns right
     text: str
+    person: bool = False  # the target is an enrolled person ("arthur"), phrased accordingly
 
     @property
     def clock(self) -> str | None:
@@ -66,17 +67,21 @@ class Guidance:
 
 
 def compute_guidance(target_cls: str, target_xy: tuple[float, float], person_xy: tuple[float, float] | None,
-                     person_heading_deg: float | None) -> Guidance:
-    name = "bottle" if target_cls == "bottle" else target_cls
+                     person_heading_deg: float | None, person: bool = False) -> Guidance:
+    name = target_cls.capitalize() if person else ("bottle" if target_cls == "bottle" else target_cls)
     if person_xy is None:
-        return Guidance(target_cls, target_xy, None, None, None, None,
-                        f"I found the {name}. I'm hovering right next to it.")
-    g = Guidance(target_cls, target_xy, person_xy, person_heading_deg, None, None, "")
+        text = (f"I found {name}. They're right here with me." if person
+                else f"I found the {name}. I'm hovering right next to it.")
+        return Guidance(target_cls, target_xy, None, None, None, None, text, person)
+    g = Guidance(target_cls, target_xy, person_xy, person_heading_deg, None, None, "", person)
     dist, turn = g.relative_to(*person_xy, person_heading_deg)
     g.distance_m, g.turn_deg = dist, turn
     meters = f"about {dist:.0f} meters" if dist >= 1.5 else "about a meter"
+    who = name if person else f"the {name}"
     if turn is None:
-        g.text = f"I found the {name}, {meters} from where you were standing. I'm hovering next to it."
+        tail = "They're with me." if person else "I'm hovering next to it."
+        g.text = f"I found {who}, {meters} from where you were standing. {tail}"
     else:
-        g.text = f"I found the {name}: {meters} away, {direction_words(turn)} ({clock_face(turn)})."
+        g.text = (f"{name} is {meters} away, {direction_words(turn)} ({clock_face(turn)})." if person
+                  else f"I found the {name}: {meters} away, {direction_words(turn)} ({clock_face(turn)}).")
     return g

@@ -140,3 +140,55 @@ def test_safety_lands_on_low_battery_mid_search():
     r.run(10.0, until=lambda rr: rr.mission.state == "LANDED")
     assert r.mission.state == "LANDED" and not r.sim.drone.flying
     assert any("battery" in e for _, e in r.drone.events)
+
+
+# ------------------------------------------------------------------ ARRIVED guidance refresh
+def _arrived_mission(said):
+    """A Mission parked in ARRIVED with known guidance, on a minimal fake ctx."""
+    from types import SimpleNamespace
+
+    from reachglass.mission.mission import Mission
+    from reachglass.query import KeywordQueryParser
+
+    ctx = SimpleNamespace(
+        now=100.0, note=lambda s: None, target_cls="bottle",
+        cfg=SimpleNamespace(mission=SimpleNamespace(announce=True)),
+        perception=SimpleNamespace(vocabulary=lambda: ["bottle"]),
+        drone=SimpleNamespace(stop=lambda: None),
+        odom=SimpleNamespace(pose=Pose2D(0.0, 0.0, 0.0)),
+        last_person=None, last_person_t=-1e9,
+    )
+    m = Mission(ctx, KeywordQueryParser(), announce=said.append)
+    m.state = "ARRIVED"
+    m.guidance = compute_guidance("bottle", (3.0, 0.0), (0.0, 0.0), 0.0)
+    return m, ctx
+
+
+def test_arrived_repeat_find_refreshes_guidance_not_search():
+    from reachglass.types import Detection, PersonObs
+
+    # person not seen recently: the original sentence again, and NO search restart
+    said = []
+    m, ctx = _arrived_mission(said)
+    m._handle("find my bottle")
+    assert m.state == "ARRIVED" and said == [m.guidance.text]
+
+    # person seen walking: fresh distance/turn from where they are NOW
+    said.clear()
+    det = Detection(cls="person", conf=0.9, bbox=(0, 0, 20, 60))
+    ctx.last_person = PersonObs(det, bearing_deg=0.0, elevation_deg=0.0, range_m=1.0,
+                                facing_deg=180.0, facing_conf=0.9)  # 1 m ahead, facing the drone
+    ctx.last_person_t = ctx.now
+    m._handle("find my bottle")
+    assert m.state == "ARRIVED" and len(said) == 1 and said[0] != m.guidance.text
+    assert "meter" in said[0]
+
+    # a DIFFERENT target must still restart the search normally
+    said.clear()
+    ctx.perception.vocabulary = lambda: ["bottle", "backpack"]
+    ctx.perception.set_target = lambda cls: None
+    try:
+        m._handle("find my backpack")
+    except AttributeError:
+        pass  # _begin_search needs the full ctx; reaching it is what we assert
+    assert not any(s == m.guidance.text for s in said)

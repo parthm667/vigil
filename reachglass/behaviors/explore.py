@@ -140,12 +140,28 @@ def choose_hop(ctx: Ctx) -> tuple[float, float, dict] | None:
     """Best (world heading, distance) to hop to next, or None if nothing is worth it."""
     c = ctx.cfg.explore
     pose = ctx.odom.pose
-    weights = c.semantic_weights.get(ctx.target_cls or "", {})
+    # a person target ("find arthur") inverts the relationship with people: any recent, not-yet-identified
+    # person sighting is a candidate to close in on (stopping person_clearance short), not a no-go zone
+    person_target = bool(getattr(ctx.perception, "name_target", None) and ctx.perception.name_target())
+    weights = (c.semantic_weights.get("_person", {}) if person_target
+               else c.semantic_weights.get(ctx.target_cls or "", {}))
     objs = ctx.memory.objects
     best = None
     for k in range(24):
         h = k * 15.0
         dist = ctx.grid.clear_distance(pose, h, c.hop_max_m, unknown_ok_m=c.hop_min_m, altitude_m=ctx.altitude)
+        cand = 0.0
+        if person_target:
+            for o in objs:
+                if o.cls != "person" or ctx.now - o.last_t >= 10.0:
+                    continue
+                ox, oy = o.xy
+                d = pose.distance_to(ox, oy)
+                ang = angdiff(math.degrees(math.atan2(oy - pose.y, ox - pose.x)), h)
+                if ang < 30:
+                    dist = min(dist, max(0.0, d - c.person_clearance_m))  # close in, keep clearance
+                if ang < 15 and d > c.person_clearance_m + 0.2:
+                    cand = 4.0  # someone that way we could not identify yet: go and look at their face
         if dist < c.hop_min_m:
             continue
         open_ = dist / c.hop_max_m
@@ -154,7 +170,7 @@ def choose_hop(ctx: Ctx) -> tuple[float, float, dict] | None:
         # what would we see from there that we have not seen yet? (the scan just covered everything within
         # view range of HERE, so novelty is measured beyond the hop's end point)
         novelty = ctx.grid.novelty(Pose2D(end[0], end[1], h), h, c.view_range_m)
-        sem, cand, people = 1.0, 0.0, 1.0
+        sem, people = 1.0, 1.0
         if ctx.person_origin is not None:  # the wearer usually waits where they asked, seen or not
             ox, oy = ctx.person_origin
             d = pose.distance_to(ox, oy)
@@ -166,7 +182,8 @@ def choose_hop(ctx: Ctx) -> tuple[float, float, dict] | None:
             if d < 0.3:
                 continue
             ang = angdiff(math.degrees(math.atan2(oy - pose.y, ox - pose.x)), h)
-            if o.cls == "person" and ctx.now - o.last_t < 10.0 and d < c.person_clearance_m + dist and ang < 30:
+            if (not person_target and o.cls == "person" and ctx.now - o.last_t < 10.0
+                    and d < c.person_clearance_m + dist and ang < 30):
                 people = 0.0  # (people move: only recent sightings count)
             if ang < 20 and d < 6.0:
                 sem += 2.0 * weights.get(o.cls, 0.0)

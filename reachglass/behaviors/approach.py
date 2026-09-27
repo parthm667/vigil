@@ -37,9 +37,11 @@ def observe_people(ctx: Ctx) -> None:
             ctx.memory.add("person", x, y, p.det.conf, p.range_m, ctx.now, ctx.vantage)
 
 
-def recent_people(ctx: Ctx, max_age_s: float = 15.0) -> list[tuple[float, float]]:
+def recent_people(ctx: Ctx, max_age_s: float = 15.0,
+                  exclude_xy: tuple[float, float] | None = None, exclude_r: float = 0.9) -> list[tuple[float, float]]:
     """Mission-frame positions of people: seen in this frame, remembered from the last seconds, and where the
-    wearer stood when they asked (a blind user usually waits there)."""
+    wearer stood when they asked (a blind user usually waits there). exclude_xy drops sightings near that
+    point: when the target IS a person, they must not block the approach to themself."""
     pts = []
     pose = ctx.odom.pose
     if ctx.res is not None:
@@ -52,17 +54,20 @@ def recent_people(ctx: Ctx, max_age_s: float = 15.0) -> list[tuple[float, float]
             pts.append(o.xy)
     if ctx.person_origin is not None:
         pts.append(ctx.person_origin)
+    if exclude_xy is not None:
+        pts = [p for p in pts if math.hypot(p[0] - exclude_xy[0], p[1] - exclude_xy[1]) >= exclude_r]
     return pts
 
 
-def person_near_path(ctx: Ctx, step_m: float, clearance_m: float) -> float | None:
+def person_near_path(ctx: Ctx, step_m: float, clearance_m: float,
+                     exclude_xy: tuple[float, float] | None = None) -> float | None:
     """If the straight flight segment ahead (0..step_m) passes within clearance_m of a person (including the
     end point: a step that stops right in front of someone counts), which side they are on: +1 right,
     -1 left. None if the path is clear."""
     pose = ctx.odom.pose
     h = math.radians(pose.heading_deg)
     fx, fy = math.cos(h), math.sin(h)
-    for px, py in recent_people(ctx):
+    for px, py in recent_people(ctx, exclude_xy=exclude_xy):
         vx, vy = px - pose.x, py - pose.y
         along = vx * fx + vy * fy
         if along < -0.3:
@@ -74,13 +79,14 @@ def person_near_path(ctx: Ctx, step_m: float, clearance_m: float) -> float | Non
     return None
 
 
-def person_free_distance(ctx: Ctx, clearance_m: float) -> float:
+def person_free_distance(ctx: Ctx, clearance_m: float,
+                         exclude_xy: tuple[float, float] | None = None) -> float:
     """How far straight ahead before coming within clearance_m of a person."""
     pose = ctx.odom.pose
     h = math.radians(pose.heading_deg)
     fx, fy = math.cos(h), math.sin(h)
     best = math.inf
-    for px, py in recent_people(ctx):
+    for px, py in recent_people(ctx, exclude_xy=exclude_xy):
         vx, vy = px - pose.x, py - pose.y
         along = vx * fx + vy * fy
         lateral = abs(fx * vy - fy * vx)
@@ -93,13 +99,24 @@ class Approach(Behavior):
     name = "approach"
 
     def __init__(self, cfg: ApproachCfg, settle_s: float = 0.7, min_altitude_m: float = 0.5,
-                 person_clearance_m: float = 1.0):
+                 person_clearance_m: float = 1.0, person_target: bool = False):
         super().__init__()
         self.c = cfg
         self.settle_s = settle_s
         self.min_altitude_m = min_altitude_m
         self.person_clearance_m = person_clearance_m
+        # the target IS a person ("find arthur"): stop respectfully short, never fly over them,
+        # and don't let their own sightings trigger the person-avoidance rules
+        self.person_target = person_target
+        self.standoff = cfg.person_standoff_m if person_target else cfg.standoff_m
         self.final: TargetObs | None = None
+
+    def _exclude(self, ctx: Ctx) -> tuple[float, float] | None:
+        """Where the target person is (memory), so avoidance ignores them."""
+        if not self.person_target:
+            return None
+        obj = ctx.memory.best(ctx.target_cls, confirmed_only=False)
+        return obj.xy if obj is not None else None
 
     def start(self, ctx: Ctx) -> None:
         ctx.perception.set_mode("approach")
@@ -114,7 +131,7 @@ class Approach(Behavior):
         self.sidesteps = 0
         self.plan: list[tuple[Discrete, str]] | None = None  # the fly-over, once started (no re-measuring)
         self.last_top: float | None = None  # height of the target's top above the floor, from the last sighting
-        self.fly = FlyYaw.for_behavior(ctx, "approach", self.c.standoff_m)  # None: discrete rotates
+        self.fly = FlyYaw.for_behavior(ctx, "approach", self.standoff)  # None: discrete rotates
         self.fly_align_t0: float | None = None
         self.fly_ok = 0
         self.fly_just_aligned = False  # the next alignment (if still needed) is a discrete rotate
@@ -190,12 +207,12 @@ class Approach(Behavior):
                 return self._arrive(ctx, t)
             pose = ctx.odom.pose
             step = min(0.3, ctx.grid.clear_distance(pose, pose.heading_deg, 0.3, unknown_ok_m=0.3, altitude_m=alt),
-                       person_free_distance(ctx, self.person_clearance_m))
-            if person_near_path(ctx, 0.3, self.person_clearance_m) is not None or step < c.min_step_m:
+                       person_free_distance(ctx, self.person_clearance_m, self._exclude(ctx)))
+            if person_near_path(ctx, 0.3, self.person_clearance_m, self._exclude(ctx)) is not None or step < c.min_step_m:
                 return self._arrive(ctx, t, overfly=False)  # close already and cannot safely creep closer
             return self._issue(ctx, Discrete("move", 30, "forward"), "range unknown: small step")
-        if r > c.standoff_m + c.tolerance_m:
-            step = min(r - c.standoff_m, c.max_step_m)
+        if r > self.standoff + c.tolerance_m:
+            step = min(r - self.standoff, c.max_step_m)
             pose = ctx.odom.pose
             clear = ctx.grid.clear_distance(pose, pose.heading_deg, step, unknown_ok_m=step, altitude_m=alt)
             step = min(step, clear)
@@ -213,31 +230,31 @@ class Approach(Behavior):
                     if in_view < step:
                         step, view_limited = in_view, True
             if step < c.min_step_m:
-                if view_limited or r < c.standoff_m + 0.6:
+                if view_limited or r < self.standoff + 0.6:
                     return self._arrive(ctx, t)  # as close as we can get while still seeing it
                 # blocked (e.g. chairs in front of the table) and still far: first try to go around
                 if self.sidesteps < 3:
                     left = ctx.grid.clear_distance(pose, pose.heading_deg - 90, 0.8, unknown_ok_m=0.5, altitude_m=alt)
                     right = ctx.grid.clear_distance(pose, pose.heading_deg + 90, 0.8, unknown_ok_m=0.5, altitude_m=alt)
                     side, room = ("left", left) if left >= right else ("right", right)
-                    if room >= 0.5 and person_near_path(ctx, 0.0, self.person_clearance_m) is None:
+                    if room >= 0.5 and person_near_path(ctx, 0.0, self.person_clearance_m, self._exclude(ctx)) is None:
                         self.sidesteps += 1
                         cm = int(min(room, 0.7) * 100)
                         return self._issue(ctx, Discrete("move", cm, side), f"path blocked: sidestep {side} {cm} cm")
-                if r < c.standoff_m + 1.5:
+                if r < self.standoff + 1.5:
                     return self._arrive(ctx, t, overfly=False)  # as close as the furniture allows
                 return self._fail(ctx, "path blocked")
             # never fly past a person: the drone starts BEHIND the wearer, so they are often near the line
-            side = person_near_path(ctx, step, self.person_clearance_m)
+            side = person_near_path(ctx, step, self.person_clearance_m, self._exclude(ctx))
             if side is not None:
                 if self.sidesteps >= 3:
-                    return self._arrive(ctx, t, overfly=False) if r < c.standoff_m + 1.5 else self._fail(ctx, "a person is in the way")
+                    return self._arrive(ctx, t, overfly=False) if r < self.standoff + 1.5 else self._fail(ctx, "a person is in the way")
                 away = "left" if side > 0 else "right"
                 heading = pose.heading_deg + (-90 if away == "left" else 90)
                 if ctx.grid.clear_distance(pose, heading, 0.8, unknown_ok_m=0.8, altitude_m=alt) >= 0.6:
                     self.sidesteps += 1
                     return self._issue(ctx, Discrete("move", 70, away), f"person near the path: sidestep {away} 70 cm")
-                step = min(step, person_free_distance(ctx, self.person_clearance_m))
+                step = min(step, person_free_distance(ctx, self.person_clearance_m, self._exclude(ctx)))
                 if step < c.min_step_m:
                     return self._fail(ctx, "a person is in the way")
             return self._issue(ctx, Discrete("move", step * 100, "forward"), f"target {r:.2f} m: forward {step:.2f} m")
@@ -322,6 +339,7 @@ class Approach(Behavior):
         self.status = f"arrived: target {t.range_m if t.range_m is None else round(t.range_m, 2)} m ahead"
         alt = ctx.altitude
         r = t.range_m if t.range_m is not None else 0.6  # no size-based range: its box is cut, it is close
+        overfly = overfly and not self.person_target  # never fly over a person's head
         plan = self._overfly_plan(ctx, r, self._top_height(ctx, t, r, alt)) if (overfly and alt is not None) else None
         if not plan:
             return SUCCESS
@@ -366,7 +384,7 @@ class Approach(Behavior):
         last = self.last_seen
         if (mem is not None and last is not None and self.last_top is not None and ctx.res is not None
                 and last.det.bbox[3] > 0.75 * ctx.res.image_size[1]
-                and pose.distance_to(*mem.xy) <= self.c.standoff_m + self.c.tolerance_m + 0.5):
+                and pose.distance_to(*mem.xy) <= self.standoff + self.c.tolerance_m + 0.5):
             # it slipped out of the bottom of the frame as we closed in: fly over where memory puts it
             b = pose.bearing_to(*mem.xy)
             if abs(b) > self.c.align_deg:

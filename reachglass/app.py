@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import socket
 import sys
 import time
 from datetime import datetime
@@ -33,8 +34,32 @@ from .runlog import RunLog
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def say(text: str) -> None:
-    print(f"\n>>> {text}\n", flush=True)
+def make_say(udp_port: int = 0):
+    """Announcements go to the terminal and, when udp_port is set, to the voice app
+    (python -m voice) as UDP datagrams. The send is best-effort: no listener, no error."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if udp_port else None
+
+    def say(text: str) -> None:
+        print(f"\n>>> {text}\n", flush=True)
+        if sock is not None:
+            try:
+                sock.sendto(text.encode("utf-8"), ("127.0.0.1", udp_port))
+            except OSError:
+                pass
+
+    return say
+
+
+def open_udp(port: int):
+    """UdpInbox or None; a busy port (another reachglass still running) must not
+    kill the app -- typed queries keep working."""
+    if not port:
+        return None
+    try:
+        return UdpInbox(port)
+    except OSError as e:
+        print(f"UDP port {port} unavailable ({e}): voice queries off for this run")
+        return None
 
 
 class Window:
@@ -100,8 +125,9 @@ def run_sim(args, cfg) -> int:
     from .sim.runner import SimRunner
 
     items = [(args.at, q) for q in args.query]
-    inbox = MultiInbox(ScriptedInbox(items), StdinInbox() if not args.headless and sys.stdin.isatty() else None)
-    r = SimRunner(cfg, inbox=inbox, seed=args.seed, announce=say)
+    udp = open_udp(args.udp)
+    inbox = MultiInbox(ScriptedInbox(items), udp, StdinInbox() if not args.headless and sys.stdin.isatty() else None)
+    r = SimRunner(cfg, inbox=inbox, seed=args.seed, announce=make_say(args.announce_udp))
     win = Window(args.headless, args.record, "ReachGlass (simulator)")
     log = RunLog(args.log)
     from .dashboard import render
@@ -121,6 +147,8 @@ def run_sim(args, cfg) -> int:
     finally:
         win.close()
         log.close()
+        if udp is not None:
+            udp.close()
     print(f"sim done: t={r.t:.1f}s state={r.mission.state} collisions={r.sim.drone.collisions}")
     for t, s, why in r.mission.history:
         print(f"  {t:6.1f}s {s:10s} {why}")
@@ -163,8 +191,8 @@ def run_tello(args, cfg) -> int:
         drone.close()
         return 3
     ctx = Ctx(cfg, drone, perception)
-    mission = Mission(ctx, KeywordQueryParser(), announce=say)
-    udp = UdpInbox(args.udp) if args.udp else None
+    mission = Mission(ctx, KeywordQueryParser(), announce=make_say(args.announce_udp))
+    udp = open_udp(args.udp)
     inbox = MultiInbox(StdinInbox(), udp, ScriptedInbox([(time.time() + args.at, q) for q in args.query]))
     win = Window(args.headless, args.record, "ReachGlass (Tello)" + (" DRY RUN" if dry else ""))
     log = RunLog(args.log)
@@ -236,6 +264,8 @@ def main(argv=None) -> int:
     p.add_argument("--realtime", action="store_true", help="sim: run at wall-clock speed")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--udp", type=int, default=5005, help="UDP port for queries (0 = off)")
+    p.add_argument("--announce-udp", type=int, default=5006,
+                   help="UDP port announcements are also sent to, for the voice app's TTS (0 = off)")
     p.add_argument("--hz", type=float, default=20.0, help="tello: control loop rate")
     p.add_argument("--quit-on-land", action="store_true")
     p.add_argument("--log", help="JSONL run log (default runs/<mode>_<time>.jsonl)")

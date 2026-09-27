@@ -166,6 +166,8 @@ class PersonObs(ObjectObs):
     facing_deg: float | None = None
     facing_conf: float = 0.0
     range_lo_m: float | None = None  # smallest of the range cues: the safe value before moving toward them
+    name: str | None = None  # who this is, when face identification is enabled and matched
+    name_sim: float = 0.0  # cosine similarity of that match
 
 
 @dataclass
