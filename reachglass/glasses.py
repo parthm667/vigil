@@ -21,6 +21,7 @@ import logging
 import math
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -68,8 +69,24 @@ class GlassesTargetView:
         self.src = None
         self.closed = False
         self.seq, self.n = -1, 0
+        self.url = gcfg.camera_url
+        self.opened_t = time.time()
+        self.reported = False  # "streaming" / "no frames" said once, so the console is not flooded
         # opening the MJPEG stream can block for seconds: never in the control loop
         threading.Thread(target=self._open, args=(gcfg.camera_url,), daemon=True).start()
+
+    def streaming(self) -> bool:
+        """Frames are arriving from the glasses camera. Says so once, or warns once after 5 s without any (the
+        stream retries by itself, silently: without this a dead camera looks exactly like a slow one)."""
+        ok = self.src is not None and self.src.read() is not None
+        if not self.reported and (ok or time.time() - self.opened_t > 5.0):
+            self.reported = True
+            if ok:
+                print(f"glasses camera: streaming from {self.url}", flush=True)
+            else:
+                log.warning("glasses camera: no frames from %s after 5 s (still trying). Is this laptop's second "
+                            "Wi-Fi joined to the glasses' 'rover' network, and are the glasses on?", self.url)
+        return ok
 
     def _open(self, url: str) -> None:
         try:
@@ -117,10 +134,27 @@ class HapticCues:
         if cfg.enabled:
             try:
                 self.link = _glasses_link()(host=cfg.host or None, max_press=cfg.max_press).start()
-                log.info("glasses haptics up: %s", self.link.host)
+                threading.Thread(target=self._check_nano, daemon=True).start()  # never delays start-up
             except Exception as e:  # noqa: BLE001 (no glasses must never stop a flight)
                 log.warning("glasses unavailable (%s: %s): cues will print and speak only",
                             type(e).__name__, e)
+
+    def _check_nano(self) -> None:
+        """Commands are UDP: nothing errors when nobody hears them. The Nano's telemetry is the proof it is
+        there, so say plainly whether it arrives."""
+        link = self.link
+        t_end = time.time() + 5.0
+        while time.time() < t_end and link is not None and link.state().stale:
+            time.sleep(0.2)
+        if link is None:
+            return
+        st = link.state()
+        if st.stale:
+            log.warning("glasses: NO telemetry from the Nano at %s: the pads will NOT move. Is this laptop's second "
+                        "Wi-Fi joined to the glasses' 'rover' network, and are the glasses on?", link.host)
+        else:
+            print(f"glasses: Nano connected at {link.host} (pads ready; ToF {st.tof_left_mm} / {st.tof_right_mm} mm)",
+                  flush=True)
 
     def __call__(self, cue: int, detail: str = "") -> None:
         print(f"guide cue: {cue:2d}   {detail}", flush=True)
@@ -138,6 +172,15 @@ class HapticCues:
         if self.say is not None and cue != self.last and cue in SPOKEN:
             self.say(SPOKEN[cue])
         self.last = cue
+
+    def release(self) -> None:
+        """Both pads off the face (guiding ended some other way than "arrived"); silent, nothing is spoken."""
+        self.last = None
+        if self.link is not None:
+            try:
+                self.link.release()
+            except Exception:  # noqa: BLE001, S110 (best effort: a dead link sends nothing anyway)
+                pass
 
     def close(self) -> None:
         if self.link is not None:

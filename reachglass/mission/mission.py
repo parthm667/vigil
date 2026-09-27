@@ -86,6 +86,10 @@ class Mission:
         return cls.capitalize() if self._is_name(cls) else f"your {cls}"
 
     def _go(self, state: str, why: str = "", child: Behavior | None = None) -> None:
+        if self.state == "GUIDE" and state != "GUIDE":  # however guiding ends: no pad may stay pressed
+            release = getattr(self.cue_fn, "release", None)
+            if release is not None:
+                release()
         self.state, self.state_t = state, self.ctx.now
         self.history.append((self.ctx.now, state, why))
         self.ctx.note(f"-> {state} {why}")
@@ -370,9 +374,10 @@ class Mission:
                 self.announce(f"You made it. {self._the(ctx.target_cls).capitalize()} is right in front of you.")
                 ctx.perception.set_mode("idle")  # all sensing done: no detector runs any more
                 self._go("DONE", f"guided to the {ctx.target_cls}: {self.child.status}")
-            elif r == FAILURE:
-                self.announce(f"I can't guide you any more ({self.child.status}).")
-                self._land(f"guide failed: {self.child.status}")
+            elif r == FAILURE:  # never lands on its own: only "land" (or the battery/flight-time safety) does
+                self.announce(f"I can't guide you right now ({self.child.status}). I'm hovering here.")
+                self._resume_state = "GUIDE"  # SPACE (resume) starts guiding again
+                self._go("HOLD", f"guide stopped: {self.child.status}")
         elif st == "DONE":
             d.rc(0, 0, 0, 0)  # finished: hover in place, sensing off, until told (land / follow me / find)
         elif st == "REACQUIRE":

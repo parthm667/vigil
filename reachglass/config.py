@@ -254,7 +254,8 @@ class GuideCfg:
     glasses_stride: int = 3  # detector on every Nth glasses frame (~4 Hz at 12 fps)
     glasses_forward_deg: float = 8.0  # glasses cue 0 (forward) below this bearing, kept until...
     glasses_forward_exit_deg: float = 15.0  # ...it exceeds this
-    glasses_lost_s: float = 8.0  # on the glasses camera, target not seen this long (connecting included): FAILURE
+    glasses_lost_s: float = 2.0  # the glasses camera has not seen it this long: back to the drone's camera...
+    glasses_retry_s: float = 3.0  # ...and the glasses are tried again this much later (no limit, never gives up)
     lost_turn_s: float = 1.5  # wearer not seen this long: turn toward where they were
     # closer than ~1 m to the drone the wearer fills the frame's width and cannot be measured: last measured within
     # the arrival distance + lost_close_m, then unmeasurable for lost_close_s (still walking in) -> arrived
