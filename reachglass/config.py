@@ -158,7 +158,6 @@ class FollowCfg:
 
 @dataclass
 class ExploreCfg:
-    scan_altitude_m: float = 1.2
     scan_step_deg: int = 45
     dwell_s: float = 0.8  # wait after each rotation before using frames (video lag + settling)
     frames_per_dwell: int = 2  # frames the TARGET detector looked at, per view (it skips frames)
@@ -182,7 +181,10 @@ class ExploreCfg:
 
 @dataclass
 class ApproachCfg:
-    standoff_m: float = 1.3  # stop this far from the target (a bottle on a table stays in frame at 1.2 m altitude)
+    standoff_m: float = 1.3  # last measurement this far from the target, then the fly-over:
+    overfly_clearance_m: float = 0.5  # climb (if needed) to this far above the object's top...
+    overshoot_m: float = 0.2  # ...and fly this far past its estimated position: hover just beyond it
+    max_overfly_m: float = 2.5  # longest blind leg (the camera cannot see below once over it)
     tolerance_m: float = 0.25
     align_deg: float = 6.0  # rotate first if |bearing| is larger
     max_step_m: float = 1.2  # longest single forward move
@@ -349,8 +351,6 @@ def validate(cfg: Config) -> Config:
         raise ValueError(f"follow.min_range_m ({f.min_range_m}) must be below follow.distance_m ({f.distance_m})")
     if f.altitude_m > s.max_altitude_m:
         raise ValueError(f"follow.altitude_m ({f.altitude_m}) is above safety.max_altitude_m ({s.max_altitude_m})")
-    if cfg.explore.scan_altitude_m < s.min_altitude_m:
-        raise ValueError("explore.scan_altitude_m is below safety.min_altitude_m")
     for name, sec in (("follow", f), ("approach", cfg.approach)):
         if sec.steering not in ("pid", "fly"):
             raise ValueError(f"{name}.steering must be 'pid' or 'fly', got {sec.steering!r}")

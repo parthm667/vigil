@@ -1,6 +1,7 @@
 """Mission state machine.
 
-    TAKEOFF -> CLIMB -> FOLLOW --(query "find X")--> DESCEND -> EXPLORE -> APPROACH -> ARRIVED
+    TAKEOFF -> CLIMB -> FOLLOW --(query "find X")--> EXPLORE -> APPROACH -> ARRIVED (hovering just past the object)
+    (the search starts at the follow altitude: no descent)
                           ^                                      |            |          |
                           +------------- REACQUIRE <--------------+-(failed)---+---(query "follow me")
     any state: "land" -> LAND -> LANDED;  "stop"/"cancel" -> REACQUIRE (back to following)
@@ -24,7 +25,7 @@ from .guidance import Guidance, compute_guidance
 
 log = logging.getLogger("reachglass.mission")
 
-STATES = ("IDLE", "TAKEOFF", "CLIMB", "FOLLOW", "DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "REACQUIRE", "HOLD",
+STATES = ("IDLE", "TAKEOFF", "CLIMB", "FOLLOW", "EXPLORE", "APPROACH", "ARRIVED", "REACQUIRE", "HOLD",
           "LAND", "LANDED")
 
 
@@ -100,8 +101,8 @@ class Mission:
     def resume(self) -> None:
         if self.state == "HOLD":
             prev = self._resume_state
-            if prev in ("EXPLORE", "APPROACH", "DESCEND", "ARRIVED") and self.ctx.target_cls:
-                self._go("DESCEND", "resume search")
+            if prev in ("EXPLORE", "APPROACH", "ARRIVED") and self.ctx.target_cls:
+                self._go("EXPLORE", "resume search", Explore(self.ctx.cfg.explore))
             else:
                 self._go("REACQUIRE", "resume", ReacquirePerson())
 
@@ -122,13 +123,13 @@ class Mission:
         if q.intent == "land":
             self._land("asked to land")
         elif q.intent == "cancel":
-            if self.state in ("DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "HOLD"):
+            if self.state in ("EXPLORE", "APPROACH", "ARRIVED", "HOLD"):
                 self.ctx.drone.stop()
                 self.announce("Okay, stopping. Coming back to you.")
                 self._reacquire("cancelled")
         elif q.intent == "follow":
             lost = self.ctx.res is None or self.ctx.res.person_unseen_s > 2.0
-            if self.state in ("DESCEND", "EXPLORE", "APPROACH", "ARRIVED", "HOLD") or (self.state == "FOLLOW" and lost):
+            if self.state in ("EXPLORE", "APPROACH", "ARRIVED", "HOLD") or (self.state == "FOLLOW" and lost):
                 self.ctx.drone.stop()
                 self.announce("Coming back to you." if self.state != "FOLLOW" else "Looking for you.")
                 self._reacquire("asked to follow")
@@ -139,10 +140,10 @@ class Mission:
                 what = q.unknown_target or "that"
                 self.announce(f"Sorry, I can't look for {what} yet. I can look for: {', '.join(vocab[:8])}.")
                 return
-            if self.state in ("DESCEND", "EXPLORE", "APPROACH") and q.target == self.ctx.target_cls:
+            if self.state in ("EXPLORE", "APPROACH") and q.target == self.ctx.target_cls:
                 self.announce(f"Still looking for your {q.target}.")  # a repeat must not restart the search
                 return
-            if self.state in ("FOLLOW", "ARRIVED", "HOLD", "REACQUIRE", "EXPLORE", "APPROACH", "DESCEND"):
+            if self.state in ("FOLLOW", "ARRIVED", "HOLD", "REACQUIRE", "EXPLORE", "APPROACH"):
                 self.ctx.drone.stop()
                 self._begin_search(q.target)
             elif self.state in ("TAKEOFF", "CLIMB"):
@@ -185,7 +186,7 @@ class Mission:
                 ctx.person_heading = wrap_deg(ctx.odom.pose.heading_deg + p.bearing_deg + facing)
         self.guidance = None
         self.announce(f"Looking for your {target}.")
-        self._go("DESCEND", f"search for {target}")
+        self._go("EXPLORE", f"search for {target}", Explore(self.ctx.cfg.explore))
 
     def _smoothed_facing(self, p) -> float | None:
         """The follow behaviour's circular mean of recent confident facings, else this frame's if confident."""
@@ -248,18 +249,6 @@ class Mission:
             self.child.step(ctx)
             if ctx.res is not None and ctx.res.person_unseen_s > 20.0 and ctx.now - self.state_t > 20.0:
                 self._reacquire("person lost for 20 s")
-        elif st == "DESCEND":
-            if self.cmd is None:
-                alt = ctx.altitude
-                cm = int(round((alt - cfg.explore.scan_altitude_m) * 100)) if alt is not None else 0
-                if abs(cm) < 20:
-                    self._go("EXPLORE", "at scan altitude", Explore(cfg.explore))
-                    return
-                self.cmd = Discrete("move", min(abs(cm), 200), "down" if cm > 0 else "up")
-            r = self.cmd.step(ctx)
-            if r != RUNNING:
-                self.cmd = None
-                self._go("EXPLORE", "descended" if r == SUCCESS else f"descend: {d.last_result()}", Explore(cfg.explore))
         elif st == "EXPLORE":
             r = self.child.step(ctx)
             if r == SUCCESS:

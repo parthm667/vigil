@@ -154,9 +154,9 @@ def test_config_defaults_and_overrides(tmp_path):
     assert cfg.perception.object_heights_m["bottle"] == 0.26 and "chair" in cfg.perception.object_heights_m
     # yaml file
     p = tmp_path / "room.yaml"
-    p.write_text("explore:\n  scan_altitude_m: 1.1\n  max_vantage_points: 3\n")
+    p.write_text("explore:\n  hop_max_m: 1.1\n  max_vantage_points: 3\n")
     cfg = load_config(p)
-    assert cfg.explore.scan_altitude_m == 1.1 and cfg.explore.max_vantage_points == 3
+    assert cfg.explore.hop_max_m == 1.1 and cfg.explore.max_vantage_points == 3
     assert to_dict(cfg)["explore"]["max_vantage_points"] == 3
 
 

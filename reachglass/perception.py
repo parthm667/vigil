@@ -111,9 +111,12 @@ class Perception:
                 return role
         return None
 
-    def object_range(self, det: Detection, cam: CameraModel) -> tuple[float | None, str]:
+    def object_range(self, det: Detection, cam: CameraModel, floor_alt: float | None = None,
+                     pitch: float = 0.0) -> tuple[float | None, str]:
         """Distance from the class size priors. Height is preferred (more pixels); for round objects the
-        width takes over when the height looks truncated (partly hidden, or cut by the image edge)."""
+        width takes over when the height looks truncated (partly hidden, or cut by the image edge).
+        floor_alt (objects standing on the floor, i.e. furniture): from well above, the bottom is below the
+        frame; the depression of the TOP edge then gives it, like a person's head."""
         pc = self.cfg.perception
         h, w = pc.object_heights_m.get(det.cls), pc.object_widths_m.get(det.cls)
         edge = 3
@@ -128,10 +131,14 @@ class Perception:
             return r_h, "height_prior"
         if r_w is not None:
             return r_w, "width_prior"
+        if h and floor_alt is not None and floor_alt - h >= 0.3 and det.bbox[1] > edge:
+            r_t = cam.range_to_height(det.cx, det.bbox[1], floor_alt - h, pitch)
+            if r_t is not None:
+                return r_t, "top_elevation"
         return None, ""
 
-    def _object_obs(self, det: Detection, cam: CameraModel, pitch: float) -> ObjectObs:
-        rng, src = self.object_range(det, cam)
+    def _object_obs(self, det: Detection, cam: CameraModel, pitch: float, floor_alt: float | None = None) -> ObjectObs:
+        rng, src = self.object_range(det, cam, floor_alt, pitch)
         return ObjectObs(det, cam.bearing_deg(det.cx), cam.elevation_deg(det.cy, pitch, det.cx), rng, src)
 
     @staticmethod
@@ -219,7 +226,7 @@ class Perception:
                         tob.confirmed = ts.confirmed
                         res.target = tob
                     res.targets.append(tob)
-        res.context = [self._object_obs(d, cam, pitch) for d in dets if d.cls not in ("person", self.target_cls)]
+        res.context = [self._object_obs(d, cam, pitch, altitude) for d in dets if d.cls not in ("person", self.target_cls)]
         res.ran = ran
         res.person_unseen_s = self.person_lock.unseen_s(frame.t)
         res.target_unseen_s = self.target_lock.unseen_s(frame.t) if self.target_cls else float("inf")
