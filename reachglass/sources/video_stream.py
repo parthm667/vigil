@@ -6,6 +6,7 @@ Kept as written by the team except (marked CHANGED):
   * the capture is opened with open/read timeouts, and stop() never releases the capture while the
     reader thread may still be inside grab(): releasing under a blocked grab() on a stalled stream
     segfaults the process (found in review; reproduced by killing the UDP sender).
+  * the unused copying read() is gone: read_seq() is the only accessor.
 """
 
 import os
@@ -71,11 +72,6 @@ class VideoStream:
                         self._seq += 1
                         self._ts = time.time()
                 last_retrieve = now
-
-    def read(self):
-        """Returns a copy of the latest frame, or None if nothing yet."""
-        with self._lock:
-            return None if self._frame is None else self._frame.copy()
 
     def read_seq(self, copy=True):
         """Returns (seq, frame, timestamp). seq only changes when a new frame was decoded.

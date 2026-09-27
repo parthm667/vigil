@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
+import socket
 import time
 from dataclasses import dataclass
 
@@ -24,6 +25,22 @@ log = logging.getLogger("reachglass.tello")
 
 MIN_GAP_S = 0.1  # the Tello drops commands sent closer together than this (djitellopy's TIME_BTW_COMMANDS)
 STOP_SETTLE_S = 1.0  # after 'stop', replies within this window belong to the stop / the cancelled command
+STREAMON_TRIES, VIDEO_WAIT_S = 4, 3.0  # streamon is re-sent until video packets arrive
+NO_VIDEO = ("the Tello answers commands but sends no video to UDP {port}. Close the Tello phone app and take the "
+            "phone off the drone's Wi-Fi (while the app is connected the drone streams to the phone), then restart "
+            "the drone. On Windows also allow Python through the firewall (inbound UDP 8890 and {port}).")
+
+
+def video_packets_arrive(port: int, timeout_s: float) -> bool:
+    """True once a UDP datagram reaches `port`. OSError if another program already holds the port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("", port))
+        s.settimeout(timeout_s)
+        try:
+            s.recv(2048)
+            return True
+        except socket.timeout:
+            return False
 
 
 @dataclass
@@ -75,8 +92,23 @@ class TelloDrone(Drone):
         if not self.dry_run:
             self._tello.send_control_command(f"speed {int(self.move_speed_cm_s)}")
         if self.video_enabled:
-            self._tello.streamon()
-            self._source = TelloVideoSource(self._tello.get_udp_video_address(), fps=self.video_fps).start()
+            self._start_video()
+
+    def _start_video(self) -> None:
+        url = self._tello.get_udp_video_address()
+        port = int(url.rsplit(":", 1)[1])
+        for i in range(STREAMON_TRIES):
+            self._tello.streamon()  # re-sent: the drone may not stream after the first one
+            try:
+                if video_packets_arrive(port, VIDEO_WAIT_S):
+                    break
+            except OSError as e:
+                raise RuntimeError(f"UDP port {port} is held by another program ({e}): close other Tello scripts "
+                                   f"and tools (find it with: lsof -nP -iUDP:{port})") from None
+            log.warning("no video packets yet (%d/%d), re-sending streamon", i + 1, STREAMON_TRIES)
+        else:
+            raise RuntimeError(NO_VIDEO.format(port=port))
+        self._source = TelloVideoSource(url, fps=self.video_fps).start()
 
     def close(self) -> None:
         try:

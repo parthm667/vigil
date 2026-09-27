@@ -1,6 +1,8 @@
 """Step 2: frame sources."""
 
 import os
+import shutil
+import subprocess
 import time
 
 import cv2
@@ -83,6 +85,26 @@ def test_team_videostream_reader_via_tello_source(video):
         assert seqs == sorted(seqs)  # never goes backwards
         assert abs(f.t - time.time()) < 5  # stamped with wall-clock time
     finally:
+        src.stop()
+    assert src.read() is None
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_tello_source_waits_for_a_stream_that_starts_after_the_open_timeout():
+    # the "can't find camera" bugs: video starting > 5 s after start() raised; keyframes 5 s apart never decoded
+    port = 11178
+    src = TelloVideoSource(url=f"udp://@0.0.0.0:{port}").start()  # must not raise
+    time.sleep(7.0)
+    ff = subprocess.Popen(["ffmpeg", "-loglevel", "quiet", "-re", "-f", "lavfi", "-i", "testsrc=size=960x720:rate=30",
+                           "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-g", "150",
+                           "-f", "h264", f"udp://127.0.0.1:{port}?pkt_size=1460"])
+    try:
+        f = src.wait_first(15.0)
+        assert f is not None and f.image.shape == (720, 960, 3)
+    finally:
+        ff.kill()
+        ff.wait()
         src.stop()
     assert src.read() is None
 

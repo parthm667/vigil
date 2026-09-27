@@ -139,7 +139,12 @@ def run_tello(args, cfg) -> int:
         return 4
     drone = SafetyGovernor(tello, cfg.safety)
     print("connecting to the Tello (join its Wi-Fi first)...")
-    drone.connect()
+    try:
+        drone.connect()
+    except Exception as e:  # no reply, a port held by another program, no video
+        print(f"cannot start the Tello: {e}")
+        drone.close()
+        return 3
     tel = drone.telemetry()
     print(f"battery {tel.battery_pct}%  {'DRY RUN: no motion commands will be sent' if dry else 'LIVE: it will fly'}")
     if not dry and tel.battery_pct is not None and tel.battery_pct < cfg.safety.min_battery_pct + 10:
@@ -153,8 +158,8 @@ def run_tello(args, cfg) -> int:
     what = spec.params.get("prompts") or spec.params.get("weights") or spec.params.get("hsv_ranges")
     print(f"bottle detector: {spec.kind} {what} (--target color / yolo-world to switch)")
     source = drone.frame_source()
-    if source.wait_first(10.0) is None:
-        print("no video from the drone after 10 s")
+    if source.wait_first(30.0) is None:
+        print("video packets arrive but no frame decoded after 30 s: move the laptop closer to the drone, restart it")
         drone.close()
         return 3
     ctx = Ctx(cfg, drone, perception)

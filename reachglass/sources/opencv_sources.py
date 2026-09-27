@@ -26,69 +26,60 @@ class TelloVideoSource(FrameSource):
     The drone must already have been told `streamon` (the drone adapter does that). Only one reader
     can bind UDP 11111: every consumer shares this source.
 
+    start() never raises: one thread opens the stream, retrying until the drone's video decodes (FFmpeg
+    gives up after its open timeout, e.g. when the drone starts streaming late), and reopens it when
+    frames stop for longer than the read timeout (after one the capture never delivers again). seq keeps increasing across reopens.
+
     fps is the reader's retrieve cap. It must sit well above the ~30 fps stream: a cap equal to the
     stream rate drops ~40 % of frames because of arrival jitter (found in review).
     """
 
     name = "tello"
 
-    def __init__(self, url: str = TELLO_UDP_URL, fps: int = 60, read_timeout_ms: int = 3000, reconnect_after_s: float = 3.5):
+    def __init__(self, url: str = TELLO_UDP_URL, fps: int = 60, timeout_ms: int = 15000, reconnect_after_s: float = 20.0):
         self.url, self.fps = url, fps
-        self.read_timeout_ms = read_timeout_ms  # 500 ms is too short: FFmpeg's stream probe gets interrupted
-        self.reconnect_after_s = reconnect_after_s
+        # FFmpeg open/read timeout. It must outlast the wait for a clean keyframe: nothing decodes before one, and
+        # the Tello sends them seconds apart (a lost packet costs a whole one). With 5 s / 3 s the capture was
+        # aborted before its first keyframe on a weak link, and a timed-out capture never delivers again.
+        self.timeout_ms = timeout_ms
+        self.reconnect_after_s = reconnect_after_s  # > timeout: a shorter gap just pauses grab(), then it resumes
         self._stream = None
         self._lock = threading.Lock()
-        self._offset = 0  # seq offset so seq stays monotonic across reconnects
-        self._last_seq = -1
-        self._last_new_t = 0.0
+        self._offset = 0  # seq offset so seq stays monotonic across reopens
         self._stop = threading.Event()
-        self._watchdog: threading.Thread | None = None
+        self._thread: threading.Thread | None = None
         self.reconnects = 0
 
-    def _open(self):
-        from .video_stream import VideoStream
-
-        return VideoStream(self.url, fps=self.fps, read_timeout_ms=self.read_timeout_ms).start()
-
     def start(self) -> TelloVideoSource:
-        if self._stream is None:
+        if self._thread is None:
             self._stop.clear()
-            self._stream = self._open()
-            self._last_new_t = time.time()
-            self._watchdog = threading.Thread(target=self._watch, daemon=True)
-            self._watchdog.start()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
         return self
 
-    def _watch(self) -> None:
-        """After a read timeout the FFmpeg capture never delivers again: reopen it when frames stop."""
-        while not self._stop.wait(0.25):
+    def _run(self) -> None:
+        from .video_stream import VideoStream
+
+        while not self._stop.is_set():
+            try:
+                stream = VideoStream(self.url, fps=self.fps, open_timeout_ms=self.timeout_ms, read_timeout_ms=self.timeout_ms).start()
+            except RuntimeError:  # nothing decodable before the open timeout: try again
+                self._stop.wait(0.5)
+                continue
             with self._lock:
-                stream = self._stream
-                if stream is None:
-                    return
-                seq, _, _ = stream.read_seq(copy=False)
-                if seq != self._last_seq and seq >= 0:
-                    self._last_seq = seq
-                    self._last_new_t = time.time()
-                    continue
-                stale = time.time() - self._last_new_t > self.reconnect_after_s
-            if stale:
-                stream.stop()  # its thread has left grab() after the read timeout -> safe to release
-                try:
-                    new = self._open()
-                except RuntimeError:
-                    new = None  # drone not streaming yet: try again next round
-                with self._lock:
-                    if self._stop.is_set():
-                        if new is not None:
-                            new.stop()
-                        return
-                    self._offset += max(self._last_seq, 0)
-                    self._last_seq = -1
-                    self._last_new_t = time.time()
+                self._stream = stream
+            last_seq, last_new_t = -1, time.time()
+            while not self._stop.wait(0.25):
+                seq = stream.read_seq(copy=False)[0]
+                if seq != last_seq:
+                    last_seq, last_new_t = seq, time.time()
+                elif time.time() - last_new_t > self.reconnect_after_s:
                     self.reconnects += 1
-                    if new is not None:
-                        self._stream = new
+                    break
+            with self._lock:
+                self._stream = None
+                self._offset += max(stream.read_seq(copy=False)[0], 0)
+            stream.stop()  # its thread leaves grab() within the read timeout -> safe to release
 
     def read(self) -> Frame | None:
         with self._lock:
@@ -100,13 +91,11 @@ class TelloVideoSource(FrameSource):
 
     def stop(self) -> None:
         self._stop.set()
-        if self._watchdog is not None:
-            self._watchdog.join(timeout=6)
-            self._watchdog = None
+        if self._thread is not None:
+            self._thread.join(timeout=2)  # a stalled capture is released by the thread itself (daemon)
+            self._thread = None
         with self._lock:
-            stream, self._stream = self._stream, None
-        if stream is not None:
-            stream.stop()
+            self._stream = None
 
 
 class _ThreadedCapture(FrameSource):

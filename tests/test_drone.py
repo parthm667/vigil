@@ -1,5 +1,6 @@
 """Step 9: Tello adapter (against a fake djitellopy) and the safety governor."""
 
+import socket
 import threading
 import time
 
@@ -7,6 +8,7 @@ import pytest
 
 from reachglass.config import SafetyCfg
 from reachglass.drone import SafetyGovernor
+from reachglass.drone import tello as tello_mod
 from reachglass.drone.tello import TelloDrone
 from reachglass.sim.drone_sim import SimDroneParams
 from reachglass.sim.scenario import Sim
@@ -78,6 +80,84 @@ def make(**kw):
     d = TelloDrone(tello=fake, video=False, **{k: v for k, v in kw.items() if k not in ("delays", "silent")})
     d.connect()
     return d, fake
+
+
+# ------------------------------------------------------------------ video start (the "can't find camera" crash)
+class StreamingFakeTello(FakeTello):
+    """Starts sending UDP 'video' datagrams to `port` on the n-th streamon (None: never, e.g. the phone app has it)."""
+
+    def __init__(self, port, stream_on_nth=1):
+        super().__init__()
+        self.port, self.stream_on_nth, self.streamons = port, stream_on_nth, 0
+        self._halt = threading.Event()
+
+    def get_udp_video_address(self):
+        return f"udp://@0.0.0.0:{self.port}"
+
+    def streamon(self):
+        super().streamon()
+        self.streamons += 1
+        if self.streamons == self.stream_on_nth:
+            threading.Thread(target=self._send, daemon=True).start()
+
+    def _send(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            while not self._halt.wait(0.02):
+                s.sendto(b"\x00\x00\x00\x01", ("127.0.0.1", self.port))
+
+    def end(self):
+        super().end()
+        self._halt.set()
+
+
+class StubSource:
+    def __init__(self, url, fps):
+        self.url = url
+
+    def start(self):
+        return self
+
+    def stop(self):
+        pass
+
+
+def free_udp_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture
+def fast_video_check(monkeypatch):
+    monkeypatch.setattr(tello_mod, "VIDEO_WAIT_S", 0.3)
+    monkeypatch.setattr(tello_mod, "TelloVideoSource", StubSource)
+
+
+def test_streamon_is_resent_until_video_packets_arrive(fast_video_check):
+    fake = StreamingFakeTello(free_udp_port(), stream_on_nth=2)  # the drone ignores the first streamon
+    d = TelloDrone(tello=fake, dry_run=True)
+    d.connect()
+    assert fake.streamons == 2 and d.frame_source().url == fake.get_udp_video_address()
+    d.close()
+
+
+def test_no_video_packets_gives_the_phone_app_diagnosis(fast_video_check):
+    fake = StreamingFakeTello(free_udp_port(), stream_on_nth=None)
+    d = TelloDrone(tello=fake, dry_run=True)
+    with pytest.raises(RuntimeError, match="phone app"):
+        d.connect()
+    assert fake.streamons == tello_mod.STREAMON_TRIES
+    d.close()
+
+
+def test_video_port_held_by_another_program_is_named(fast_video_check):
+    port = free_udp_port()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as other:
+        other.bind(("", port))
+        d = TelloDrone(tello=StreamingFakeTello(port), dry_run=True)
+        with pytest.raises(RuntimeError, match=f"lsof -nP -iUDP:{port}"):
+            d.connect()
+        d.close()
 
 
 # ------------------------------------------------------------------ Tello adapter
