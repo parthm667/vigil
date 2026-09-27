@@ -191,7 +191,11 @@ def run_tello(args, cfg) -> int:
         drone.close()
         return 3
     ctx = Ctx(cfg, drone, perception)
-    mission = Mission(ctx, KeywordQueryParser(), announce=make_say(args.announce_udp))
+    from .glasses import HapticCues
+
+    say = make_say(args.announce_udp)
+    cues = HapticCues(cfg.glasses, say=say)  # guide cues -> haptic pads + spoken directions
+    mission = Mission(ctx, KeywordQueryParser(), announce=say, cue=cues)
     udp = open_udp(args.udp)
     inbox = MultiInbox(StdinInbox(), udp, ScriptedInbox([(time.time() + args.at, q) for q in args.query]))
     win = Window(args.headless, args.record, "ReachGlass (Tello)" + (" DRY RUN" if dry else ""))
@@ -241,6 +245,7 @@ def run_tello(args, cfg) -> int:
         finally:
             win.close()
             log.close()
+            cues.close()  # release the pads now, not after the Nano's 600 ms failsafe
             if udp is not None:
                 udp.close()
             drone.close()

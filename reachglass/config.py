@@ -311,6 +311,16 @@ class MissionCfg:
 
 
 @dataclass
+class GlassesCfg:
+    """The glasses' Nano (haptic pads + ToF) over the CAM's "rover" WiFi; firmware/HARDWARE_INTERFACE.md.
+    Video from the glasses camera is separate and not configured here."""
+
+    enabled: bool = False  # drive the haptic pads from the guide cues (needs the 2nd WiFi adapter on "rover")
+    host: str = ""  # the Nano; "" = discovery beacon, else its static 192.168.4.50
+    max_press: int = 100  # host-side ceiling on press depth 0-100 (the Nano clamps again)
+
+
+@dataclass
 class Config:
     camera: CameraCfg = field(default_factory=CameraCfg)
     perception: PerceptionCfg = field(default_factory=PerceptionCfg)
@@ -323,6 +333,7 @@ class Config:
     safety: SafetyCfg = field(default_factory=SafetyCfg)
     drone: DroneCfg = field(default_factory=DroneCfg)
     mission: MissionCfg = field(default_factory=MissionCfg)
+    glasses: GlassesCfg = field(default_factory=GlassesCfg)
 
 
 # ---------------------------------------------------------------------- merging

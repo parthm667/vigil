@@ -34,3 +34,6 @@ fly:
                                       # untrained hand calibration (held 8-10 m + surged in flight 2026-09-27).
                                       # Keep false unless a FLY full-arm (yaw+fwd) checkpoint is trained.
 safety: {max_altitude_m: 2.3}                 # keep below your ceiling
+
+glasses: {enabled: true}                      # haptic pads on the guide cues (2nd WiFi adapter on "rover";
+                                              # if the glasses are off it warns once and continues without them)
