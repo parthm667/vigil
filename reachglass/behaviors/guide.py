@@ -326,6 +326,8 @@ class Guide(Behavior):
                                 ctx.cfg.glasses, ctx.perception.detectors["target"], ctx.target_cls,
                                 ctx.cfg.perception.object_heights_m.get(ctx.target_cls), c.glasses_stride)
                             ctx.note("guide: in range and facing it: opening the glasses camera (the drone guides meanwhile)")
+                            print(f"[guide] {self.last_d_target:.1f} m out and facing the target: opening the "
+                                  f"ESP32 glasses camera (drone keeps guiding until frames arrive)", flush=True)
                         elif ctx.now >= self.g_retry_at and self.gv.streaming():
                             self._to_glasses(ctx, f"{self.last_d_target:.1f} m away and facing it")
                             return RUNNING
@@ -358,6 +360,7 @@ class Guide(Behavior):
         ctx.perception.set_mode("idle")  # no detector runs on the drone's frames while the glasses guide
         self.glasses_mode, self.g_seen_t, self.g_arrive = True, ctx.now, 0  # g_seen_t: time to find it
         ctx.note(f"guide: switching to the glasses camera ({why}); the drone's camera is no longer used")
+        print(f"[guide] SWITCHED to the ESP32 glasses camera ({why}); drone camera idle", flush=True)
 
     def _to_drone(self, ctx: Ctx, why: str) -> None:
         """Back to the drone's camera; the glasses are tried again after glasses_retry_s (never given up)."""
@@ -365,6 +368,7 @@ class Guide(Behavior):
         self.miss_since = None  # the drone was not looking meanwhile: not "unseen" for all that time
         ctx.perception.set_mode("guide")
         ctx.note(f"guide: {why}: back to the drone's camera (the glasses will be tried again)")
+        print(f"[guide] back to the DRONE camera ({why}); glasses retried in {self.c.glasses_retry_s:.0f} s", flush=True)
 
     def _step_glasses(self, ctx: Ctx) -> str:
         """After the handoff, the only camera: cue from the target's bearing in the glasses camera; arrived once
