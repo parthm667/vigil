@@ -1,0 +1,14 @@
+# Local yaw-only fly: the brain steers, the PID range loop sets forward speed.
+# Pair with configs/train_local.yaml sizes. Use --label fly_yaw_only.
+brain:
+  fly_forward: pid
+episode:
+  follow_s: 30.0
+  approach_s: 20.0
+train:
+  popsize: 16
+  episodes_per_candidate: 4
+  approach_episodes: 1
+  generations: 400
+  selection_every: 10
+  selection_seeds: [1000, 1016]

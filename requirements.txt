@@ -7,3 +7,5 @@ ultralytics>=8.3          # YOLO person / object detection (pulls in torch)
 pytest>=8                 # tests
 transformers>=4.45        # Depth-Anything-V2 monocular depth (free space during exploration)
 clip @ git+https://github.com/ultralytics/CLIP.git   # YOLO-World open-vocabulary text encoder
+# Optional fruit fly steering (follow.steering: fly), see README section 9:
+#   pip install -e /path/to/fruitfly-training/third_party/FlyDrones -e /path/to/fruitfly-training

@@ -2,7 +2,9 @@
 
 Each cycle (after the drone has settled and a fresh frame shows the target):
   1. target sinking out of the bottom of the frame -> descend 20-30 cm (keeps a low object in view)
-  2. |bearing| > align_deg                          -> rotate onto it
+  2. |bearing| > align_deg                          -> rotate onto it (approach.steering: fly -> the fruit fly
+                                                        controller turns onto it with continuous rc yaw; if it
+                                                        stops short, one discrete rotate trims the rest)
   3. range > standoff + tolerance                   -> move forward min(range - standoff, max_step),
                                                         never beyond the clearance proven along the way
   4. otherwise                                      -> ARRIVED (SUCCESS); `final` holds the last observation
@@ -15,8 +17,11 @@ import math
 
 from ..config import ApproachCfg
 from ..types import TargetObs
-from .base import FAILURE, RUNNING, SUCCESS, Behavior, Ctx, Discrete
+from .base import FAILURE, RUNNING, SUCCESS, Behavior, Ctx, Discrete, clamp
 from .explore import FOOTPRINT, observe
+from .fly_steer import FlyYaw
+
+FLY_ALIGN_TIMEOUT_S = 5.0  # fly alignment taking longer than this: the discrete rotate finishes the turn
 
 
 def observe_people(ctx: Ctx) -> None:
@@ -102,6 +107,10 @@ class Approach(Behavior):
         self.final = None
         self.last_seen: TargetObs | None = None
         self.sidesteps = 0
+        self.fly = FlyYaw.for_behavior(ctx, "approach", self.c.standoff_m)  # None: discrete rotates
+        self.fly_align_t0: float | None = None
+        self.fly_ok = 0
+        self.fly_just_aligned = False  # the next alignment (if still needed) is a discrete rotate
 
     def _issue(self, ctx: Ctx, cmd: Discrete, why: str) -> str:
         self.cmd = cmd
@@ -112,6 +121,8 @@ class Approach(Behavior):
 
     def step(self, ctx: Ctx) -> str:
         c = self.c
+        if self.fly is not None and self.fly_align_t0 is None:
+            self.fly.yaw(ctx.now)  # keep the brain ticking (no target input) while discrete moves own the drone
         if self.cmd is not None:
             r = self.cmd.step(ctx)
             if r == RUNNING:
@@ -122,6 +133,8 @@ class Approach(Behavior):
             if failed:
                 self.status = "move refused/failed: re-measuring"
             return RUNNING
+        if self.fly_align_t0 is not None:
+            return self._fly_align(ctx)
         if self.steps > c.max_steps:
             self.status = "too many approach steps"
             return FAILURE
@@ -147,7 +160,14 @@ class Approach(Behavior):
                 and self._safe_to_descend(ctx, alt - 0.25)):
             return self._issue(ctx, Discrete("move", 25, "down"), "target low in the frame: descend 25 cm")
         if abs(t.bearing_deg) > c.align_deg:
+            if self.fly is not None and not self.fly.failed and not self.fly_just_aligned:
+                self.steps += 1
+                self.fly_align_t0, self.fly_ok = ctx.now, 0
+                ctx.note(f"approach: fly steering onto the target ({t.bearing_deg:+.0f} deg)")
+                return self._fly_align(ctx)
+            self.fly_just_aligned = False
             return self._issue(ctx, Discrete("rotate", t.bearing_deg), f"align {t.bearing_deg:+.0f} deg")
+        self.fly_just_aligned = False
         r = t.range_m
         if r is None:
             # no size-based range (box cut by the frame edge): we are close; accept if it is big
@@ -207,6 +227,32 @@ class Approach(Behavior):
                     return self._fail(ctx, "a person is in the way")
             return self._issue(ctx, Discrete("move", step * 100, "forward"), f"target {r:.2f} m: forward {step:.2f} m")
         return self._arrive(ctx, t)
+
+    def _fly_align(self, ctx: Ctx) -> str:
+        """The fly turns the drone onto the target with rc yaw, until it is centred (within align_deg on 3
+        frames), lost for 0.5 s, or FLY_ALIGN_TIMEOUT_S passes. Then hover, settle, re-measure.
+        No range goes to the fly (as in follow): it sees the target at its standoff size (s = 1), where its
+        steering is calibrated; a bottle several metres away would look smaller than anything it trained on."""
+        t = ctx.res.target if (ctx.new_frame and ctx.res is not None) else None
+        if t is not None and t.confirmed:
+            self.last_seen = t
+            yaw = self.fly.yaw(ctx.now, t.bearing_deg, None, ctx.frame.t, fallback=clamp(t.bearing_deg, 20))
+            self.fly_ok = self.fly_ok + 1 if abs(t.bearing_deg) <= self.c.align_deg else 0
+            self.status = f"fly steering: target {t.bearing_deg:+.0f} deg, yaw {yaw:+.0f}"
+        else:
+            yaw = self.fly.yaw(ctx.now, fallback=0.0)
+        timeout = ctx.now - self.fly_align_t0 > FLY_ALIGN_TIMEOUT_S
+        if self.fly_ok >= 3 or timeout or self.fly.failed or not self.fly.target_valid:
+            ctx.drone.rc(0, 0, 0, 0)
+            self.fly_align_t0 = None
+            self.fly_just_aligned = True
+            ctx.cmd_done_t = ctx.now  # like a finished rotate: only frames after the turn (+ video lag) count
+            self.settle_until = ctx.now + self.settle_s
+            why = "centred" if self.fly_ok >= 3 else "timeout" if timeout else "target lost" if not self.fly.failed else "failed"
+            ctx.note(f"approach: fly steering done ({why})")
+            return RUNNING
+        ctx.drone.rc(0, 0, 0, int(yaw))
+        return RUNNING
 
     # ------------------------------------------------------------------ keeping a low target in view
     def _target_base_height(self, ctx: Ctx, t: TargetObs, r: float, alt: float) -> float:

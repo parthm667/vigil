@@ -1,0 +1,492 @@
+{
+ "arm": "pid",
+ "run_name": "pid-s1-local-v2",
+ "run_seed": 1,
+ "backend": "serial",
+ "host": "parth-vivo",
+ "platform": "Windows-11-10.0.26200-SP0",
+ "config": "configs/train_local.yaml",
+ "generation": 400,
+ "evaluations": 6400,
+ "wall_hours": 0.0,
+ "updated_utc": "2026-09-26 10:45 UTC",
+ "finished": true,
+ "sigma": 0.055172018971838335,
+ "cma_sigma_raw": 29317.775107964964,
+ "latest_train_score": NaN,
+ "latest_summary": {},
+ "best_selection_score": -0.5231368885850287,
+ "best_generation": 140,
+ "best_params": {
+  "kp_yaw": 125.72127586714672,
+  "kd_yaw": 0.2883779092193935,
+  "kp_fwd": 42.07933159299535,
+  "deadband_m": 0.003101506738892589
+ },
+ "selection_history": [
+  [
+   1,
+   -0.7525279217274428,
+   {
+    "follow_in_band": 0.3230555555555555,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6994182934260141,
+    "approach_success": 0.75
+   }
+  ],
+  [
+   10,
+   -0.5375981736992289,
+   {
+    "follow_in_band": 0.3277777777777778,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6942034710386382,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   20,
+   -0.526645754854652,
+   {
+    "follow_in_band": 0.3329166666666667,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6874167488946693,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   30,
+   -0.5508025895156374,
+   {
+    "follow_in_band": 0.29930555555555555,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7291840377235578,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   40,
+   -0.5275685442205834,
+   {
+    "follow_in_band": 0.3365277777777778,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6853879149224921,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   50,
+   -0.5393110209367825,
+   {
+    "follow_in_band": 0.31597222222222227,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7016317329524985,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   60,
+   -0.5277800908316319,
+   {
+    "follow_in_band": 0.33388888888888885,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6859839324917485,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   70,
+   -0.5272808024418857,
+   {
+    "follow_in_band": 0.3344444444444445,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6859749134958409,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   80,
+   -0.6904913296829489,
+   {
+    "follow_in_band": 0.3759722222222222,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6602753145905763,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   90,
+   -0.5288755489501633,
+   {
+    "follow_in_band": 0.3301388888888889,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6896130195031226,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   100,
+   -0.559007870202978,
+   {
+    "follow_in_band": 0.2883333333333334,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7370329176562715,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   110,
+   -0.5296643643828041,
+   {
+    "follow_in_band": 0.3248611111111111,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.692709494461483,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   120,
+   -0.6472100304244988,
+   {
+    "follow_in_band": 0.3709722222222222,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6633645611705069,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   130,
+   -0.5378893671423266,
+   {
+    "follow_in_band": 0.3169444444444444,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7004535203615325,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   140,
+   -0.5231368885850287,
+   {
+    "follow_in_band": 0.35402777777777766,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.678296951921606,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   150,
+   -0.5289533141707138,
+   {
+    "follow_in_band": 0.3286111111111111,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6911190802863363,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   160,
+   -0.5464643248223873,
+   {
+    "follow_in_band": 0.31249999999999994,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7128732209769977,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   170,
+   -0.6713327367458924,
+   {
+    "follow_in_band": 0.25138888888888883,
+    "follow_collisions": 2,
+    "follow_rms_range": 0.7701758184954045,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   180,
+   -0.546778848141865,
+   {
+    "follow_in_band": 0.3131944444444444,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7087015254664647,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   190,
+   -0.5332479140206655,
+   {
+    "follow_in_band": 0.32375,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6931046293965738,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   200,
+   -0.5235482412228879,
+   {
+    "follow_in_band": 0.3545833333333333,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6774841277863851,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   210,
+   -0.5311894645875455,
+   {
+    "follow_in_band": 0.32263888888888886,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6939406677752724,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   220,
+   -0.5260456969939915,
+   {
+    "follow_in_band": 0.36222222222222217,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6705831048632912,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   230,
+   -0.5251128259859883,
+   {
+    "follow_in_band": 0.36458333333333326,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6698109619446776,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   240,
+   -0.5468524160014302,
+   {
+    "follow_in_band": 0.30569444444444444,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7223570221357377,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   250,
+   -0.5383427488316772,
+   {
+    "follow_in_band": 0.31472222222222224,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.705089900800337,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   260,
+   -0.536605198068606,
+   {
+    "follow_in_band": 0.3166666666666667,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7005113218073031,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   270,
+   -0.5398188769670931,
+   {
+    "follow_in_band": 0.31555555555555553,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7024726207422605,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   280,
+   -0.5271559149471867,
+   {
+    "follow_in_band": 0.3611111111111111,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6718083477808046,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   290,
+   -0.6834965005712028,
+   {
+    "follow_in_band": 0.3727777777777778,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6618026809701266,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   300,
+   -0.6876109652128514,
+   {
+    "follow_in_band": 0.3756944444444444,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6604998407509303,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   310,
+   -0.5548721743723892,
+   {
+    "follow_in_band": 0.2936111111111111,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7350048195413708,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   320,
+   -0.525888084543649,
+   {
+    "follow_in_band": 0.34097222222222223,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6831074276124393,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   330,
+   -0.5266108315236536,
+   {
+    "follow_in_band": 0.37013888888888885,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6637729270941164,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   340,
+   -0.5573054431406406,
+   {
+    "follow_in_band": 0.28902777777777783,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7390364708151642,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   350,
+   -0.5281980561461082,
+   {
+    "follow_in_band": 0.3697222222222221,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6657866085740568,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   360,
+   -0.5368966967811687,
+   {
+    "follow_in_band": 0.31708333333333333,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6997933950867923,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   370,
+   -0.6644327186197688,
+   {
+    "follow_in_band": 0.25777777777777783,
+    "follow_collisions": 2,
+    "follow_rms_range": 0.7605820521674014,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   380,
+   -0.5413780411774526,
+   {
+    "follow_in_band": 0.31458333333333327,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7030935930047743,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   390,
+   -0.5513971654624106,
+   {
+    "follow_in_band": 0.3611111111111111,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.6717655803671433,
+    "approach_success": 1.0
+   }
+  ],
+  [
+   400,
+   -0.5474680137624972,
+   {
+    "follow_in_band": 0.31027777777777776,
+    "follow_collisions": 1,
+    "follow_rms_range": 0.7162462019830219,
+    "approach_success": 1.0
+   }
+  ]
+ ],
+ "mean_unit": [
+  0.7278372266253292,
+  0.0028682452241756765,
+  0.6020039538343769,
+  0.0004325502023757781
+ ],
+ "mean_params": {
+  "kp_yaw": 143.55985000959265,
+  "kd_yaw": 0.1720947134505406,
+  "kp_fwd": 33.87369938086804,
+  "deadband_m": 0.00017302008095031125
+ },
+ "param_names": [
+  "kp_yaw",
+  "kd_yaw",
+  "kp_fwd",
+  "deadband_m"
+ ],
+ "norm": {},
+ "calibration": {},
+ "dn_types": [
+  "DNa02",
+  "DNa01",
+  "DNb05",
+  "DNg13",
+  "DNb06"
+ ],
+ "brain_path": "data/brains/pursuit_core1.npz",
+ "covariance": [
+  [
+   0.0,
+   0.0,
+   -0.0,
+   -0.0
+  ],
+  [
+   0.0,
+   0.0,
+   0.0,
+   -0.0
+  ],
+  [
+   -0.0,
+   0.0,
+   0.0,
+   -0.0
+  ],
+  [
+   -0.0,
+   -0.0,
+   -0.0,
+   0.0
+  ]
+ ]
+}

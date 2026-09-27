@@ -1,0 +1,119 @@
+# Default training config for the pursuit controller (docs/DRONE_RL_PLAN.md section 4).
+# Local and Modal configs override pieces of this file.
+
+brain:
+  path: data/brains/pursuit_core1.npz     # built by `python -m flyfollow.brain.build`
+  lif: {dt: 0.5}                          # Shiu et al. 2024 parameters otherwise (FlyDrones defaults)
+  dn_types: [DNa02, DNa01, DNb05, DNg13, DNb06]
+  fly_forward: brain                      # "brain" or "pid" (yaw-only fly if the audit B test fails)
+
+# Drone response measured in the lag test on 2026-09-26 (data/lag_test, flyfollow/tools/analyze_lag.py).
+# Stick 30 steps only, so gains at larger sticks assume linearity (not measured yet).
+drone:
+  measured:
+    yaw_dead_time_s: 0.17
+    yaw_tau_s: 0.05
+    yaw_gain_dps_per_100: 55.1
+    fwd_dead_time_s: 0.48
+    fwd_tau_s: 0.44
+    fwd_gain_mps_per_100: 0.96
+    vert_dead_time_s: 0.40
+    vert_gain_mps_per_100: 0.32
+    video_latency_s: 0.25                 # video onset 0.21 s after state onset, plus state stream latency
+  randomize:
+    yaw_dead_time_s: [0.12, 0.24]
+    yaw_tau_s: [0.02, 0.10]
+    yaw_gain_dps_per_100: [40.0, 70.0]
+    fwd_dead_time_s: [0.35, 0.60]
+    fwd_tau_s: [0.30, 0.60]
+    fwd_gain_mps_per_100: [0.70, 1.30]
+    vert_gain_mps_per_100: [0.25, 0.60]
+    video_latency_s: [0.15, 0.35]
+    detector_time_s: [0.03, 0.10]
+    detection_rate_hz: [10.0, 25.0]
+    hover_drift_sigma_mps: [0.0, 0.05]
+
+camera:
+  width: 960
+  height: 720
+  fx_nominal: 921.0
+  fy_nominal: 919.0
+  fx_range: [650.0, 950.0]                # true focal length randomized (HFOV about 54 to 72 degrees)
+  box_center_sigma_px: [1.0, 5.0]
+  box_height_noise: [0.03, 0.10]
+  dropout_iid: [0.0, 0.15]
+  burst_rate_per_s: [0.0, 0.2]
+  burst_len_s: [0.2, 1.5]
+  false_box_rate: [0.0, 0.02]
+  min_detect_px: 20.0
+
+governor:
+  follow_distance_m: [1.5, 2.5]
+  side_offset_deg: [-10.0, 10.0]
+  max_fwd_stick: [40.0, 90.0]             # about 0.4 to 0.9 m/s at the measured gain
+  max_back_stick: 50.0                    # about 0.5 m/s; 20 could not escape a person turning back
+  backoff_margin_m: 0.3                   # stop advancing this far outside the minimum distance
+  max_yaw_stick: 60.0
+  min_person_dist_m: [1.0, 1.3]
+  min_object_dist_m: 0.5
+  cy_ref_frac: [0.0, 0.12]                # target this far below image center (fraction of height)
+  slew_stick_per_s: 300.0
+  lost_hold_s: 0.5
+  lost_hover_s: 5.0
+  lost_land_s: 10.0
+  approach_alt_floor_m: 0.8
+
+person:
+  height_m: [1.50, 1.90]
+  head_size_m: [0.20, 0.26]
+  head_size_assumed_m: 0.23
+  speed_frac_of_drone_max: 0.85           # walker never outruns the drone's speed cap
+  speed_cap_mps: 0.9
+  straight_s: [2.0, 8.0]
+  stop_s: [1.0, 6.0]
+  turn_deg: [30.0, 150.0]
+  turn_rate_dps: [30.0, 90.0]
+  step_toward_prob: 0.5
+
+objects:
+  size_m: [0.08, 0.30]
+  prior_mismatch: [0.75, 1.25]
+  height_m: [0.0, 1.0]
+  floor_frac: 0.3
+  start_extra_range_m: [0.5, 4.0]
+  start_bearing_deg: [-20.0, 20.0]
+
+episode:
+  dt: 0.05
+  follow_s: 60.0
+  approach_s: 25.0
+  brain_warmup_s: 1.0
+  follow_start_range_extra_m: [0.3, 4.0]  # start range = min distance + this
+  follow_start_bearing_deg: [-25.0, 25.0]
+
+reward:
+  band_frac: 0.15
+  band_frac_approach: 0.30                # object size priors are off by up to 25 %
+  w_range: 1.0
+  w_image: 4.0                            # doubled: was 8 % of PID cost, plan wants 10 to 40 %
+  w_jerk: 5.0
+  w_safety: 1.0
+  w_lost: 5.0
+  w_close: 10.0
+  ev_loss: -10.0
+  ev_close: -20.0
+  ev_collision: -200.0
+  ev_approach_success: 20.0
+  approach_success_hold_s: 2.0
+
+train:
+  popsize: 32
+  sigma0: 0.2
+  maxstd: 0.3                             # cap the CMA step size; without it the PID run's sigma ran away to 2.2
+  episodes_per_candidate: 8
+  approach_episodes: 3                    # of episodes_per_candidate
+  generations: 150
+  selection_every: 10
+  selection_seeds: [1000, 1064]
+  test_seeds: [2000, 2200]
+  train_seed_base: 10000

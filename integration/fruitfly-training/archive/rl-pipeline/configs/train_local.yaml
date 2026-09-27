@@ -1,0 +1,12 @@
+# Local CPU run on the laptop (8 cores). Smaller than the Modal run so a generation
+# finishes in minutes; the CMA state it writes can seed a Modal run with --init-from.
+episode:
+  follow_s: 30.0
+  approach_s: 20.0
+train:
+  popsize: 16
+  episodes_per_candidate: 4
+  approach_episodes: 1
+  generations: 400
+  selection_every: 10
+  selection_seeds: [1000, 1016]

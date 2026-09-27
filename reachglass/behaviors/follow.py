@@ -18,10 +18,12 @@ from collections import deque
 
 from ..config import FollowCfg
 from .base import RUNNING, Behavior, Ctx, clamp, deadband
+from .fly_steer import FlyYaw
 
 
 class FollowBehind(Behavior):
     name = "follow"
+    fly: FlyYaw | None = None  # fruit fly yaw (follow.steering: fly), set in start(); None = the yaw law below
 
     def __init__(self, cfg: FollowCfg):
         super().__init__()
@@ -37,6 +39,7 @@ class FollowBehind(Behavior):
         self.last_bearing = 0.0
 
     def start(self, ctx: Ctx) -> None:
+        self.fly = FlyYaw.for_behavior(ctx, "follow", self.c.distance_m)
         ctx.perception.set_mode("follow")
         self.ranges.clear()
         self.facings.clear()
@@ -89,6 +92,10 @@ class FollowBehind(Behavior):
                 self.range_hist.append((ctx.now, r))
             r_lo = min(v for v in (p.range_lo_m, r) if v is not None) if (p.range_lo_m or r) else None
             yaw = clamp(deadband(p.bearing_deg, c.yaw_deadband_deg) * c.yaw_gain, c.max_rc_yaw)
+            if self.fly is not None:  # fly steering: replaces only this yaw value (no range: it steers at size s = 1,
+                # unless fly.forward is on: then the fly needs the true size to judge distance)
+                rng = r if self.fly.fwd_enabled else None
+                yaw = clamp(self.fly.yaw(ctx.now, p.bearing_deg, rng, ctx.frame.t, fallback=yaw), c.max_rc_yaw)
             fwd, approaching = 0.0, False
             width, height = ctx.res.image_size
             too_big = p.det.w > self.max_box_width_frac * width
@@ -110,6 +117,16 @@ class FollowBehind(Behavior):
                     approaching = closing < -c.approach_rate_mps
                     if approaching:
                         fwd = min(fwd, clamp(100.0 * closing - 10, c.max_rc_backoff))
+            if self.fly is not None and self.fly.fwd_enabled:
+                # full fly following: the fly's forward stick replaces the distance PID, under the same gates:
+                # approach only when the most conservative range cue says it is safe, keep the feed-forward
+                # back-away, and the too-close override below still wins
+                f = self.fly.forward(fallback=fwd)
+                if f > 0 and not (r_lo is not None and r_lo > c.min_range_m and not too_big):
+                    f = 0.0
+                if approaching:
+                    f = min(f, fwd)
+                fwd = max(-float(c.max_rc_backoff), min(float(c.max_rc_forward), f))
             if (r_lo is not None and r_lo < c.min_range_m) or too_big:
                 fwd = -c.max_rc_backoff  # too close: back off fast and gain a little height
                 ud = max(ud, self._climb_rc(ctx) // 2)
@@ -140,7 +157,8 @@ class FollowBehind(Behavior):
             ctx.drone.rc(*self.cmd)
             self.status = "person close and out of view: backing off to the side"
         elif unseen < 0.35:  # between frames: keep the last command
-            ctx.drone.rc(*self.cmd[:2], ud, self.cmd[3])
+            yaw = self.cmd[3] if self.fly is None else int(clamp(self.fly.yaw(ctx.now, fallback=self.cmd[3]), c.max_rc_yaw))
+            ctx.drone.rc(*self.cmd[:2], ud, yaw)
         elif unseen < 1.0:
             ctx.drone.rc(0, 0, ud, 0)
             self.status = "person briefly lost: holding"

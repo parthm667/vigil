@@ -1,0 +1,9 @@
+# Full-size run on Modal CPU containers (plan section 4.6). The brain sim is numpy on CPU,
+# so no GPU is needed.
+train:
+  popsize: 32
+  episodes_per_candidate: 8
+  approach_episodes: 3
+  generations: 150
+  selection_every: 10
+  selection_seeds: [1000, 1064]

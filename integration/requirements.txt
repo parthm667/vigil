@@ -1,0 +1,7 @@
+# What the standalone YOLO module needs (a subset of the root requirements.txt):
+#   pip install -r integration/requirements.txt
+numpy>=1.26
+opencv-python>=4.9        # colour check, test images
+ultralytics>=8.3          # YOLO person / object detection (pulls in torch)
+clip @ git+https://github.com/ultralytics/CLIP.git   # YOLO-World open-vocabulary text encoder
+pytest>=8                 # tests

@@ -151,6 +151,9 @@ class FollowCfg:
     min_range_m: float = 0.55  # the most conservative distance cue below this: back off (and never approach)
     max_box_width_frac: float = 0.75  # person box wider than this fraction of the frame: back off
     search_yaw_rc: int = 20  # yaw speed when the person is lost
+    # who decides the yaw stick while the person is in view: "pid" (yaw_gain / yaw_deadband_deg above) or
+    # "fly" (the fruit fly connectome controller, see FlyCfg). Distance, altitude, orbit and safety are unchanged.
+    steering: str = "pid"
 
 
 @dataclass
@@ -186,6 +189,35 @@ class ApproachCfg:
     min_step_m: float = 0.2  # Tello minimum move is 20 cm
     reacquire_scan_deg: int = 30
     max_steps: int = 20  # moves + turns + sidesteps + searches before giving up
+    # "pid": align with a discrete rotate by the bearing. "fly": the fruit fly controller turns onto the target
+    # with continuous rc yaw (see FlyCfg); forward moves, descents and sidesteps stay discrete.
+    steering: str = "pid"
+
+
+@dataclass
+class FlyCfg:
+    """Fruit fly steering (flyfollow.steer.FlySteer), used where follow.steering / approach.steering is "fly".
+
+    Needs the flyfollow package (pip install -e <fruitfly-training> and its third_party/FlyDrones). If it is
+    missing or fails, the behaviour logs a warning and uses its own yaw law instead.
+    """
+
+    # trainer best.json; recommended: <fruitfly-training>/data/brains/trained/FLY-YAW_smooth_best.json (trained, then
+    # fine-tuned for a smooth stick; FLY-YAW_best.json = trained, tracks tighter); "" = untrained hand calibration
+    params_path: str = ""
+    brain_path: str = ""  # pursuit subgraph .npz; "" = the one named in best.json, else flyfollow's default
+    latency_s: float | None = None  # capture -> frame arrival (s) its latency filter predicts across; None = drone.video_lag_s
+    max_rc_yaw: int = 40  # clamp on the fly's yaw stick (follow also applies follow.max_rc_yaw; safety.max_rc last)
+    # stick smoothing (spiking neurons make a noisy stick), measured on the sim (fruitfly-training REACHGLASS.md):
+    smoothing_ms: float = 0.0  # low-pass time constant (ms); 0 = off: 40 to 250 ms added lag and bearing error
+    deadband: float = 4.0  # subtracted from |yaw| (stick units), like follow.yaw_deadband_deg
+    slew: float = 300.0  # max stick change per second (0 = off); a safety cap, never reached in the sim
+    hysteresis: float = 3.0  # the stick only moves when the new value differs by more than this (removes dither)
+    viz: bool = False  # publish the fly body + brain view (run: python -m flyfollow.viz.live --brain <npz>)
+    # Full fly following: the fly also drives the forward/back stick in FOLLOW (the person's range is then fed
+    # to the fly as size, s = z_ref / range). UNVALIDATED by the fruitfly team's benchmarks (they measured yaw
+    # only at s = 1); follow's too-close backoff, approach gate and the SafetyGovernor still apply on top.
+    forward: bool = False
 
 
 @dataclass
@@ -227,6 +259,7 @@ class Config:
     follow: FollowCfg = field(default_factory=FollowCfg)
     explore: ExploreCfg = field(default_factory=ExploreCfg)
     approach: ApproachCfg = field(default_factory=ApproachCfg)
+    fly: FlyCfg = field(default_factory=FlyCfg)
     safety: SafetyCfg = field(default_factory=SafetyCfg)
     drone: DroneCfg = field(default_factory=DroneCfg)
     mission: MissionCfg = field(default_factory=MissionCfg)
@@ -318,6 +351,9 @@ def validate(cfg: Config) -> Config:
         raise ValueError(f"follow.altitude_m ({f.altitude_m}) is above safety.max_altitude_m ({s.max_altitude_m})")
     if cfg.explore.scan_altitude_m < s.min_altitude_m:
         raise ValueError("explore.scan_altitude_m is below safety.min_altitude_m")
+    for name, sec in (("follow", f), ("approach", cfg.approach)):
+        if sec.steering not in ("pid", "fly"):
+            raise ValueError(f"{name}.steering must be 'pid' or 'fly', got {sec.steering!r}")
     if t.max_age_s < t.lost_after_s:
         raise ValueError("tracking.max_age_s must be >= tracking.lost_after_s (else re-locking a returning target fails)")
     return cfg

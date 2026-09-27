@@ -163,3 +163,25 @@ the mission frame. `guidance.relative_to(x, y, heading)` gives the distance and 
 current pose as they walk. The drone can keep estimating that pose with the person estimator (it hovers
 next to the target facing the room). The glasses' L/R cues then come from that turn angle, plus the
 glasses camera once the target is in view.
+
+## 9. Optional: fruit fly steering
+
+The fruitfly-training team's connectome controller (`flyfollow.steer.FlySteer`, 1,446 LIF neurons from the
+fruit fly's pursuit circuit) can decide the **yaw stick** in FOLLOW and APPROACH. Everything else stays ours:
+perception, distance and altitude hold, orbit, lost-person search, the approach's discrete moves, and the
+`SafetyGovernor`, which still clamps every command. The default is unchanged (`steering: pid`).
+
+```bash
+pip install -e /path/to/fruitfly-training/third_party/FlyDrones -e /path/to/fruitfly-training   # into this venv
+```
+```yaml
+follow: {steering: fly}          # pid = our yaw law (the default)
+approach: {steering: fly}        # fly: continuous rc yaw onto the target instead of a discrete rotate
+fly:
+  params_path: /path/to/fruitfly-training/data/brains/trained/FLY-YAW_smooth_best.json   # "" = hand calibration
+  # deadband: 4, hysteresis: 3, slew: 300, smoothing_ms: 0   # stick smoothing (defaults shown)
+  # latency_s: 0.25                  # default: drone.video_lag_s
+  # viz: true                        # fly body + brain window: python -m flyfollow.viz.live --brain <npz>
+```
+If `flyfollow` is missing or the fly fails, the behaviour logs one warning and uses our yaw law.
+Details and sim numbers: `docs/integration/REACHGLASS.md` in fruitfly-training.

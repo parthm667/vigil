@@ -1,0 +1,62 @@
+# Pursuit brain groups for MaleCNS v1.0 (docs/DRONE_RL_PLAN.md 4.1, 4.3).
+# Read by flyfollow.brain.build. Layout mirrors FlyDrones configs (brain / inputs / outputs) so
+# `flydrones.brain.Brain(connectome, cfg)` can use this file directly.
+# Group names under inputs/outputs are FROZEN in flyfollow/interfaces.py (INPUT_GROUPS, OUTPUT_GROUPS).
+# Sides come from the patched build_malecns: rootSide where present, else somaSide.
+# All type regexes are anchored so e.g. ^LC10a$ never matches LC10a-like types.
+
+brain:
+  source: data/brains/pursuit_core1.npz
+  min_synapses: 3
+  lif:
+    dt: 0.5
+    noise_mv: 0.0
+  record_neurons: 0
+
+inputs:
+  LC10a_L: {types: ["^LC10a$"], side: L, note: "steering target input, split into 8 azimuth bins"}
+  LC10a_R: {types: ["^LC10a$"], side: R}
+  LC9_L: {types: ["^LC9$"], side: L}
+  LC9_R: {types: ["^LC9$"], side: R}
+  LC11_L: {types: ["^LC11$"], side: L}
+  LC11_R: {types: ["^LC11$"], side: R}
+  # P1 = Kimura 2008 "P1" = Cachero 2010 pMP-e = Yu 2010 pMP4. In MaleCNS v1.0 these are the pC1_*
+  # types whose `synonyms` column lists "Cachero 2010: pMP-e; Yu 2010: pMP4" (all fru/dsx co-expressing,
+  # mostly male-specific): 25 types, 43 cells per side. pC1x (Sten 2025) and the dsx-only pC1 types
+  # are NOT included (audit-only group PC1X below).
+  AROUSAL_L:
+    types: &p1 ["^pC1_1a$", "^pC1_1b$", "^pC1_2a$", "^pC1_2b$", "^pC1_2c$", "^pC1_2a/2b$", "^pC1_3a$", "^pC1_3b$",
+                "^pC1_3c$", "^pC1_5a$", "^pC1_5b$", "^pC1_6a$", "^pC1_7a$", "^pC1_7b$", "^pC1_12a$", "^pC1_13a$",
+                "^pC1_14a$", "^pC1_14b$", "^pC1_15a$", "^pC1_15b$", "^pC1_15c$", "^pC1_16a$", "^pC1_16b$",
+                "^pC1_17a$", "^pC1_17b$"]
+    side: L
+    note: "P1 candidates (pMP-e / pMP4 synonym); tonic arousal drive"
+  AROUSAL_R: {types: *p1, side: R}
+
+outputs:
+  DNa02_L: {types: ["^DNa02$"], side: L}
+  DNa02_R: {types: ["^DNa02$"], side: R}
+  DNa01_L: {types: ["^DNa01$"], side: L}
+  DNa01_R: {types: ["^DNa01$"], side: R}
+  DNb05_L: {types: ["^DNb05$"], side: L}
+  DNb05_R: {types: ["^DNb05$"], side: R}
+  DNg13_L: {types: ["^DNg13$"], side: L}
+  DNg13_R: {types: ["^DNg13$"], side: R}
+  DNb06_L: {types: ["^DNb06$"], side: L}
+  DNb06_R: {types: ["^DNb06$"], side: R}
+
+# Audit-only groups: resolved and stored in the .npz for reporting, never used as inputs or outputs
+# by sensorimotor_core (role hidden) unless the G0 outcome requires expansion.
+audit_groups:
+  DNp09_L: {types: ["^DNp09$"], side: L}
+  DNp09_R: {types: ["^DNp09$"], side: R}
+  AOTU019_L: {types: ["^AOTU019$"], side: L}
+  AOTU019_R: {types: ["^AOTU019$"], side: R}
+  LC10b_L: {types: ["^LC10b$"], side: L}
+  LC10b_R: {types: ["^LC10b$"], side: R}
+  LC10d_L: {types: ["^LC10d$"], side: L}
+  LC10d_R: {types: ["^LC10d$"], side: R}
+  LC10e_L: {types: ["^LC10e$"], side: L}
+  LC10e_R: {types: ["^LC10e$"], side: R}
+  PC1X_L: {types: ["^pC1x_[a-d]$"], side: L}
+  PC1X_R: {types: ["^pC1x_[a-d]$"], side: R}

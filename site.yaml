@@ -26,5 +26,11 @@ perception:
   person_height_m: 1.70              # step 4: wearer's real height WITH SHOES, to +-2 cm
   person_height_sd_m: 0.02
 
-follow: {altitude_m: 1.9, distance_m: 1.0}    # defaults; altitude_m >= wearer height + 0.2
+follow: {altitude_m: 1.9, distance_m: 1.8, steering: fly}    # 1.8 m: shoulders in frame (facing/orbit work); fly's trained standoff
+approach: {steering: fly}                     # fruit fly yaw (REACHGLASS.md); pid = old behavior
+fly:
+  params_path: integration/fruitfly-training/data/brains/trained/FLY-YAW_smooth2_best.json
+  forward: false                      # the FLY-YAW weights have NO trained forward readout: fly fb is
+                                      # untrained hand calibration (held 8-10 m + surged in flight 2026-09-27).
+                                      # Keep false unless a FLY full-arm (yaw+fwd) checkpoint is trained.
 safety: {max_altitude_m: 2.3}                 # keep below your ceiling
