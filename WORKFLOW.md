@@ -48,8 +48,13 @@ Two terminals, venv active (`.\.venv\Scripts\activate`):
 
 ```powershell
 python -m reachglass tello --config site.yaml     # terminal 1: the drone stack
-python -m voice                                   # terminal 2: AirPods voice control
+python -m voice --hands-free                      # terminal 2: AirPods, mic always on
 ```
+
+`--hands-free` = just talk, no stem press (utterances are cut by silence; only sentences with
+a command word — find / where / stop / land / takeoff / follow — are sent, and the mic gates
+off while the drone is speaking). Drop the flag for the original push-to-talk stem mode.
+Note: hands-free keeps the AirPods in HFP the whole session, so all audio is mono/phone-quality.
 
 Startup lines worth watching in terminal 1:
 

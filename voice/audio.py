@@ -97,6 +97,55 @@ class Recorder:
         return np.concatenate(blocks) if blocks else np.zeros(0, dtype=np.float32)
 
 
+    def listen(self, on_utterance, paused=None, tick=None) -> None:
+        """Hands-free: hold ONE input stream open (the AirPods stay in HFP for the whole
+        session) and segment utterances by energy. on_utterance(audio) per utterance;
+        paused() True drops audio (the TTS is speaking: don't transcribe ourselves);
+        tick() runs every block (~50 ms) for the caller's housekeeping. Ctrl+C to stop."""
+        import sounddevice as sd
+
+        idx, name = find_input_device(self.input_substr)
+        if idx is None:
+            print(f"[audio] no '{self.input_substr}' input found -> using {name}")
+        q: queue.Queue[np.ndarray] = queue.Queue()
+
+        def callback(indata, frames, t, status):
+            q.put(indata[:, 0].copy())
+
+        blocks: list[np.ndarray] = []
+        speaking = False
+        quiet_s = 0.0
+        with sd.InputStream(samplerate=self.rate, channels=1, dtype="float32",
+                            device=idx, blocksize=int(self.rate * 0.05),
+                            callback=callback):
+            while True:
+                if tick is not None:
+                    tick()
+                try:
+                    block = q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if paused is not None and paused():
+                    blocks.clear()  # our own TTS (or its tail): never an utterance
+                    speaking, quiet_s = False, 0.0
+                    continue
+                dur = block.size / self.rate
+                loud = float(np.sqrt(np.mean(block**2))) >= self.silence_rms
+                if loud:
+                    speaking = True
+                    quiet_s = 0.0
+                elif speaking:
+                    quiet_s += dur
+                blocks.append(block)
+                if speaking and (quiet_s >= self.trailing_silence_s
+                                 or sum(b.size for b in blocks) >= self.rate * self.max_s):
+                    on_utterance(np.concatenate(blocks))
+                    blocks.clear()
+                    speaking, quiet_s = False, 0.0
+                elif not speaking and sum(b.size for b in blocks) > self.rate * 1.0:
+                    del blocks[:-4]  # keep only a short pre-roll while nobody is talking
+
+
 def play(data: np.ndarray, rate: int = 16000) -> None:
     """Blocking playback (used by the selftest to echo the recording)."""
     import sounddevice as sd

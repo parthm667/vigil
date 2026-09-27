@@ -73,6 +73,8 @@ def main(argv=None) -> int:
     p.add_argument("--listen", type=float, default=30.0, help="--text: seconds to listen for announcements")
     p.add_argument("--speak", action="store_true", help="--text: also speak the announcements")
     p.add_argument("--selftest", action="store_true", help="hardware smoke test (devices, stem, record, STT, TTS)")
+    p.add_argument("--hands-free", action="store_true",
+                   help="mic always on: talk any time, no stem press (AirPods stay in HFP/mono)")
     p.add_argument("--stt", default=None, help="whisper model (default base.en; tiny.en if slow)")
     p.add_argument("--tts", choices=["auto", "edge", "sapi"], default="auto")
     p.add_argument("--device", default=None, help="input device name substring (default AirPods)")
@@ -98,7 +100,8 @@ def main(argv=None) -> int:
         return run_selftest(cfg, tts_backend=args.tts)
     from .loop import VoiceApp
 
-    return VoiceApp(cfg, tts_backend=args.tts).run()
+    app = VoiceApp(cfg, tts_backend=args.tts)
+    return app.run_hands_free() if args.hands_free else app.run()
 
 
 if __name__ == "__main__":

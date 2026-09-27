@@ -354,6 +354,10 @@ class Mission:
                     self.announce(f"I lost {self._the(ctx.target_cls)}. Coming back to you.")
                     self._reacquire(self.child.status)
         elif st == "ARRIVED":
+            if self.cmd is not None:  # settling to mission.arrived_altitude_m first
+                if self.cmd.step(ctx) == RUNNING:
+                    return
+                self.cmd = None
             d.rc(0, 0, 0, 0)  # hover next to the target as a beacon (keep-alive)
             if cfg.guide.enabled and self._guide_target is not None:
                 self._go("GUIDE", "guide the wearer to it", self._new_guide())
@@ -389,6 +393,14 @@ class Mission:
         self.announce(self.guidance.text)
         self._guide_target = target_xy
         self._guide_top = getattr(self.child, "last_top", None)  # the object's top, measured by the approach
+        # settle lower over the target: a beacon at head height is easier to relate to the object
+        want = ctx.cfg.mission.arrived_altitude_m
+        alt = ctx.altitude
+        if want > 0 and alt is not None and alt - want >= 0.25:  # Tello min move 20 cm + margin
+            floor = ctx.cfg.safety.min_altitude_m + 0.2
+            drop = alt - max(want, floor)
+            self.cmd = Discrete("move", min(int(round(drop * 100)), 200), "down")
+            ctx.note(f"arrived: descending {drop:.2f} m to {max(want, floor):.1f} m")
         self._go("ARRIVED", why)
 
     def _step_reacquire(self) -> None:

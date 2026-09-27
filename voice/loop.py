@@ -80,6 +80,62 @@ class VoiceApp:
         if any(w in text for w in ("find", "where")):
             self.last_find = text
 
+    # ------------------------------------------------------------------ hands-free
+    KEYWORDS = ("find", "where", "stop", "cancel", "land", "takeoff", "take off",
+                "follow", "come back", "what's around", "whats around")
+
+    def run_hands_free(self) -> int:
+        """Mic always on: one open stream, utterances segmented by silence, no stem needed.
+        The mic is gated off while the TTS speaks (plus a short hangover) so the app never
+        transcribes itself, and only text containing a command keyword is sent, so chatter
+        near the wearer does not turn into drone commands. Stem presses still work.
+        Note: the open mic keeps the AirPods in HFP for the whole session (mono audio)."""
+        print(f"[voice] hands-free: mic is live, just talk "
+              f"(-> {self.cfg.send_host}:{self.cfg.send_port}, <- :{self.cfg.announce_port})")
+        self.speaker.speak("Voice control ready. Just talk.")
+        self._quiet_until = 0.0
+
+        def paused() -> bool:
+            if self.speaker.busy():
+                self._quiet_until = time.time() + 0.6  # hangover: don't catch our own tail
+                return True
+            return time.time() < self._quiet_until
+
+        def tick() -> None:
+            for msg in self._poll_announcements(self.rx):
+                print(f"[voice] announce: {msg}")
+                self.last_announcement = msg
+                self.speaker.speak(msg)
+            g = self.gestures.poll()
+            if g == DOUBLE:
+                self.repeat()
+            elif g == TRIPLE:
+                print("[voice] triple press -> stop")
+                self._send("stop")
+
+        def on_utterance(audio) -> None:
+            text = self.stt.transcribe(audio)
+            if not text:
+                return
+            low = text.lower()
+            if not any(k in low for k in self.KEYWORDS):
+                print(f"[voice] heard {text!r}: no command word, ignoring")
+                return
+            print(f"[voice] heard: {text!r}")
+            earcons.play(earcons.got_it_blip())
+            self._send(text)
+            if any(w in low for w in ("find", "where")):
+                self.last_find = text
+
+        try:
+            self.recorder.listen(on_utterance, paused=paused, tick=tick)
+        except KeyboardInterrupt:
+            print("\n[voice] bye")
+        finally:
+            self.rx.close()
+            self.speaker.close()
+        return 0
+
     def repeat(self) -> None:
         """Re-speak the last announcement now, and nudge the mission to refresh
         guidance for the current target (in ARRIVED it recomputes from the

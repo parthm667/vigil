@@ -308,6 +308,8 @@ class DroneCfg:
 class MissionCfg:
     takeoff: bool = True
     announce: bool = True  # print spoken-style messages (audio hook)
+    arrived_altitude_m: float = 1.5  # descend to this height once at the target (a lower beacon
+    # is easier to relate to the object; 0 = stay at the approach altitude)
 
 
 @dataclass
