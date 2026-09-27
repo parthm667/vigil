@@ -1,19 +1,14 @@
-"""Approach: close in on the confirmed target with discrete moves, re-measuring after every move.
+"""Approach: fly straight to where the MAP puts the target, and a little past it.
 
-Each cycle (after the drone has settled and a fresh frame shows the target):
-  1. target sinking out of the bottom of the frame -> descend 20-30 cm (keeps a low object in view)
-  2. |bearing| > align_deg                          -> rotate onto it (approach.steering: fly -> the fruit fly
-                                                        controller turns onto it with continuous rc yaw; if it
-                                                        stops short, one discrete rotate trims the rest)
-  3. range > standoff + tolerance                   -> move forward min(range - standoff, max_step),
-                                                        never beyond the clearance proven along the way
-  4. otherwise (close, centred)                     -> fly over it: climb to overfly_clearance_m above its top
-                                                        if needed, then forward range + overshoot_m in one move
-                                                        (the camera cannot see below). Then SUCCESS, hovering
-                                                        just past it; `final` holds the last observation.
-                                                        Not safe (a person near the path, obstacle, no room to
-                                                        climb, too far) -> SUCCESS where it is.
-Lost for > 1.5 s: turn toward where memory says it is, then small alternating sweeps; give up after a few.
+The search already located it (semantic memory, from the scans). No re-measuring, no re-searching:
+  1. turn to the mapped position
+  2. climb, if needed, to overfly_clearance_m above the target's top (measured when the search confirmed it)
+  3. fly forward distance + overshoot_m (in moves of at most 4 m): the drone ends just past the target
+The target IS a person ("find arthur"): no climb, no fly-over; stop person_standoff_m short of them, and
+their own position does not count as a person in the way.
+A person ahead near that straight path (or where the wearer stood) -> do not go: hover here (SUCCESS).
+A lost reply (timeout: the Tello most likely did it) or a refused climb -> carry on with the plan; a refused
+turn or forward move -> stop there (SUCCESS). No target in memory -> FAILURE.
 """
 
 from __future__ import annotations
@@ -22,11 +17,9 @@ import math
 
 from ..config import ApproachCfg
 from ..types import TargetObs
-from .base import FAILURE, RUNNING, SUCCESS, Behavior, Ctx, Discrete, clamp
-from .explore import FOOTPRINT, observe
-from .fly_steer import FlyYaw
+from .base import FAILURE, RUNNING, SUCCESS, Behavior, Ctx, Discrete
 
-FLY_ALIGN_TIMEOUT_S = 5.0  # fly alignment taking longer than this: the discrete rotate finishes the turn
+MAX_MOVE_M = 4.0  # the Tello's move command takes at most 5 m
 
 
 def observe_people(ctx: Ctx) -> None:
@@ -102,321 +95,98 @@ class Approach(Behavior):
                  person_clearance_m: float = 1.0, person_target: bool = False):
         super().__init__()
         self.c = cfg
-        self.settle_s = settle_s
-        self.min_altitude_m = min_altitude_m
         self.person_clearance_m = person_clearance_m
-        # the target IS a person ("find arthur"): stop respectfully short, never fly over them,
-        # and don't let their own sightings trigger the person-avoidance rules
-        self.person_target = person_target
-        self.standoff = cfg.person_standoff_m if person_target else cfg.standoff_m
-        self.final: TargetObs | None = None
-
-    def _exclude(self, ctx: Ctx) -> tuple[float, float] | None:
-        """Where the target person is (memory), so avoidance ignores them."""
-        if not self.person_target:
-            return None
-        obj = ctx.memory.best(ctx.target_cls, confirmed_only=False)
-        return obj.xy if obj is not None else None
+        self.person_target = person_target  # also set in start() when perception says the target is a name
+        self.final: TargetObs | None = None  # the confirming sighting (guidance reads it)
+        self.last_top: float | None = None  # height of the target's top above the floor
 
     def start(self, ctx: Ctx) -> None:
         ctx.perception.set_mode("approach")
         ctx.perception.set_target(ctx.target_cls)
+        # same test as the search: an enrolled person's name -> never fly over them
+        self.person_target = self.person_target or bool(
+            getattr(ctx.perception, "name_target", None) and ctx.perception.name_target())
+        self.plan: list[tuple[Discrete, str]] | None = None
         self.cmd: Discrete | None = None
-        self.settle_until = ctx.now + self.settle_s
-        self.lost_since: float | None = None
-        self.search_tries = 0
-        self.steps = 0
-        self.final = None
-        self.last_seen: TargetObs | None = None
-        self.sidesteps = 0
-        self.plan: list[tuple[Discrete, str]] | None = None  # the fly-over, once started (no re-measuring)
-        self.last_top: float | None = None  # height of the target's top above the floor, from the last sighting
-        self.fly = FlyYaw.for_behavior(ctx, "approach", self.standoff)  # None: discrete rotates
-        self.fly_align_t0: float | None = None
-        self.fly_ok = 0
-        self.fly_just_aligned = False  # the next alignment (if still needed) is a discrete rotate
-
-    def _issue(self, ctx: Ctx, cmd: Discrete, why: str) -> str:
-        self.cmd = cmd
-        self.steps += 1
-        self.status = why
-        ctx.note(f"approach: {why}")
-        return RUNNING
+        t = ctx.res.target if ctx.res is not None else None
+        self.final = t if (t is not None and t.confirmed) else None
+        alt = ctx.altitude
+        self.last_top = (self._top_height(ctx, t, t.range_m, alt)
+                         if self.final is not None and t.range_m is not None and alt is not None else None)
 
     def step(self, ctx: Ctx) -> str:
-        c = self.c
-        if self.fly is not None and self.fly_align_t0 is None:
-            self.fly.yaw(ctx.now)  # keep the brain ticking (no target input) while discrete moves own the drone
+        cls = ctx.target_cls
+        if self.plan is None:
+            obj = ctx.memory.best(cls, confirmed_only=False)
+            if obj is None:
+                self.status = f"no {cls} on the map"
+                return FAILURE
+            self.plan = self._plan(ctx, obj.xy)
+            if not self.plan:
+                return SUCCESS  # status says why it stays here
         if self.cmd is not None:
             r = self.cmd.step(ctx)
             if r == RUNNING:
                 return RUNNING
-            failed = r == FAILURE
-            self.cmd = None
-            self.settle_until = ctx.now + self.settle_s
-            if failed:
-                self.status = "move refused/failed: re-measuring"
-            if self.plan is not None:
-                if failed or not self.plan:
-                    self.plan = None
-                    self.status = f"{'stopped short of' if failed else 'over'} the {ctx.target_cls}"
-                    return SUCCESS
-                return self._issue(ctx, *self.plan.pop(0))
-            return RUNNING
-        if self.fly_align_t0 is not None:
-            return self._fly_align(ctx)
-        if self.steps > c.max_steps:
-            self.status = "too many approach steps"
-            return FAILURE
-        ctx.drone.rc(0, 0, 0, 0)
-        if ctx.new_frame and ctx.res is not None and ctx.res.persons and ctx.now >= self.settle_until:
-            observe_people(ctx)  # keep track of people on every settled frame (the path check needs them)
-        if ctx.now < self.settle_until or not ctx.new_frame or ctx.res is None or not ctx.frame_after_cmd():
-            return RUNNING
-        if not ctx.res.target_ran:
-            return RUNNING  # the target detector skips frames: "no target" on this one means nothing
-        t = ctx.res.target
-        if t is None or not t.confirmed:
-            return self._lost(ctx)
-        self.lost_since = None
-        self.search_tries = 0
-        self.last_seen = t
-        observe(ctx, mark_view=False)
-        H = ctx.res.image_size[1]
-        alt = ctx.altitude
-        if alt is not None and t.range_m is not None:
-            self.last_top = self._top_height(ctx, t, t.range_m, alt)
-        known = [v for v in (alt, ctx.clearance) if v is not None]
-        below = min(known) if known else None  # clearance to whatever is under us
-        if (t.det.bbox[3] > 0.92 * H and alt is not None and below is not None and below - 0.25 >= self.min_altitude_m
-                and self._safe_to_descend(ctx, alt - 0.25)):
-            return self._issue(ctx, Discrete("move", 25, "down"), "target low in the frame: descend 25 cm")
-        if abs(t.bearing_deg) > c.align_deg:
-            if self.fly is not None and not self.fly.failed and not self.fly_just_aligned:
-                self.steps += 1
-                self.fly_align_t0, self.fly_ok = ctx.now, 0
-                ctx.note(f"approach: fly steering onto the target ({t.bearing_deg:+.0f} deg)")
-                return self._fly_align(ctx)
-            self.fly_just_aligned = False
-            return self._issue(ctx, Discrete("rotate", t.bearing_deg), f"align {t.bearing_deg:+.0f} deg")
-        self.fly_just_aligned = False
-        r = t.range_m
-        if r is None:
-            # no size-based range (box cut by the frame edge): we are close; accept if it is big
-            if t.det.h > 0.35 * H:
-                return self._arrive(ctx, t)
-            pose = ctx.odom.pose
-            step = min(0.3, ctx.grid.clear_distance(pose, pose.heading_deg, 0.3, unknown_ok_m=0.3, altitude_m=alt),
-                       person_free_distance(ctx, self.person_clearance_m, self._exclude(ctx)))
-            if person_near_path(ctx, 0.3, self.person_clearance_m, self._exclude(ctx)) is not None or step < c.min_step_m:
-                return self._arrive(ctx, t, overfly=False)  # close already and cannot safely creep closer
-            return self._issue(ctx, Discrete("move", 30, "forward"), "range unknown: small step")
-        if r > self.standoff + c.tolerance_m:
-            step = min(r - self.standoff, c.max_step_m)
-            pose = ctx.odom.pose
-            clear = ctx.grid.clear_distance(pose, pose.heading_deg, step, unknown_ok_m=step, altitude_m=alt)
-            step = min(step, clear)
-            # keep a LOW target in view: the camera cannot tilt, so after the step the target must still be
-            # above the bottom of the frame; descend first if needed, else shorten the step
-            view_limited = False
-            if alt is not None:
-                need = self._altitude_for(ctx, t, r, r - step, alt)
-                if need is not None and need < alt - 0.2:
-                    down = min(alt - need, below - self.min_altitude_m if below is not None else 0.0)
-                    if down >= 0.2 and self._safe_to_descend(ctx, alt - down):
-                        cm = int(min(down, 1.0) * 100)
-                        return self._issue(ctx, Discrete("move", cm, "down"), f"target low ahead: descend {cm} cm first")
-                    in_view = self._max_step_in_view(ctx, t, r, alt)
-                    if in_view < step:
-                        step, view_limited = in_view, True
-            if step < c.min_step_m:
-                if view_limited or r < self.standoff + 0.6:
-                    return self._arrive(ctx, t)  # as close as we can get while still seeing it
-                # blocked (e.g. chairs in front of the table) and still far: first try to go around
-                if self.sidesteps < 3:
-                    left = ctx.grid.clear_distance(pose, pose.heading_deg - 90, 0.8, unknown_ok_m=0.5, altitude_m=alt)
-                    right = ctx.grid.clear_distance(pose, pose.heading_deg + 90, 0.8, unknown_ok_m=0.5, altitude_m=alt)
-                    side, room = ("left", left) if left >= right else ("right", right)
-                    if room >= 0.5 and person_near_path(ctx, 0.0, self.person_clearance_m, self._exclude(ctx)) is None:
-                        self.sidesteps += 1
-                        cm = int(min(room, 0.7) * 100)
-                        return self._issue(ctx, Discrete("move", cm, side), f"path blocked: sidestep {side} {cm} cm")
-                if r < self.standoff + 1.5:
-                    return self._arrive(ctx, t, overfly=False)  # as close as the furniture allows
-                return self._fail(ctx, "path blocked")
-            # never fly past a person: the drone starts BEHIND the wearer, so they are often near the line
-            side = person_near_path(ctx, step, self.person_clearance_m, self._exclude(ctx))
-            if side is not None:
-                if self.sidesteps >= 3:
-                    return self._arrive(ctx, t, overfly=False) if r < self.standoff + 1.5 else self._fail(ctx, "a person is in the way")
-                away = "left" if side > 0 else "right"
-                heading = pose.heading_deg + (-90 if away == "left" else 90)
-                if ctx.grid.clear_distance(pose, heading, 0.8, unknown_ok_m=0.8, altitude_m=alt) >= 0.6:
-                    self.sidesteps += 1
-                    return self._issue(ctx, Discrete("move", 70, away), f"person near the path: sidestep {away} 70 cm")
-                step = min(step, person_free_distance(ctx, self.person_clearance_m, self._exclude(ctx)))
-                if step < c.min_step_m:
-                    return self._fail(ctx, "a person is in the way")
-            return self._issue(ctx, Discrete("move", step * 100, "forward"), f"target {r:.2f} m: forward {step:.2f} m")
-        return self._arrive(ctx, t)
-
-    def _fly_align(self, ctx: Ctx) -> str:
-        """The fly turns the drone onto the target with rc yaw, until it is centred (within align_deg on 3
-        frames), lost for 0.5 s, or FLY_ALIGN_TIMEOUT_S passes. Then hover, settle, re-measure.
-        No range goes to the fly (as in follow): it sees the target at its standoff size (s = 1), where its
-        steering is calibrated; a bottle several metres away would look smaller than anything it trained on."""
-        t = ctx.res.target if (ctx.new_frame and ctx.res is not None) else None
-        if t is not None and t.confirmed:
-            self.last_seen = t
-            yaw = self.fly.yaw(ctx.now, t.bearing_deg, None, ctx.frame.t, fallback=clamp(t.bearing_deg, 20))
-            self.fly_ok = self.fly_ok + 1 if abs(t.bearing_deg) <= self.c.align_deg else 0
-            self.status = f"fly steering: target {t.bearing_deg:+.0f} deg, yaw {yaw:+.0f}"
-        else:
-            yaw = self.fly.yaw(ctx.now, fallback=0.0)
-        timeout = ctx.now - self.fly_align_t0 > FLY_ALIGN_TIMEOUT_S
-        if self.fly_ok >= 3 or timeout or self.fly.failed or not self.fly.target_valid:
-            ctx.drone.rc(0, 0, 0, 0)
-            self.fly_align_t0 = None
-            self.fly_just_aligned = True
-            ctx.cmd_done_t = ctx.now  # like a finished rotate: only frames after the turn (+ video lag) count
-            self.settle_until = ctx.now + self.settle_s
-            why = "centred" if self.fly_ok >= 3 else "timeout" if timeout else "target lost" if not self.fly.failed else "failed"
-            ctx.note(f"approach: fly steering done ({why})")
-            return RUNNING
-        ctx.drone.rc(0, 0, 0, int(yaw))
+            failed, self.cmd = self.cmd, None
+            if r == FAILURE and failed.result != "error: timeout" and failed.direction != "up":
+                self.status = f"stopped short of the {cls} ({failed.result})"
+                return SUCCESS
+        if not self.plan:
+            self.status = f"{'next to' if self.person_target else 'over'} the {cls}"
+            return SUCCESS
+        self.cmd, self.status = self.plan.pop(0)
+        ctx.note(f"approach: {self.status}")
         return RUNNING
 
-    # ------------------------------------------------------------------ keeping a low target in view
-    def _target_base_height(self, ctx: Ctx, t: TargetObs, r: float, alt: float) -> float:
-        """Height of the target's bottom above the floor, from its range and the elevation of its box bottom."""
-        cam = ctx.perception.camera.for_frame(*ctx.res.image_size)
-        el = cam.elevation_deg(t.det.bbox[3], 0.0, t.det.cx)
-        return alt + r * math.tan(math.radians(el))
-
-    def _allowed_depression(self, ctx: Ctx) -> float:
-        cam = ctx.perception.camera.for_frame(*ctx.res.image_size)
-        return cam.vfov_deg / 2.0 - 4.0 - cam.pitch_deg  # keep the bottom 4 deg away from the frame edge
-
-    def _altitude_for(self, ctx: Ctx, t: TargetObs, r_now: float, r_next: float, alt: float) -> float | None:
-        """Highest altitude at which the target's bottom stays in view from r_next, or None if no limit."""
-        z_b = self._target_base_height(ctx, t, r_now, alt)
-        dep = math.radians(self._allowed_depression(ctx))
-        need = z_b + max(r_next, 0.3) * math.tan(dep)
-        return need if need < alt else None
-
-    def _max_step_in_view(self, ctx: Ctx, t: TargetObs, r: float, alt: float) -> float:
-        z_b = self._target_base_height(ctx, t, r, alt)
-        dep = math.radians(self._allowed_depression(ctx))
-        closest = (alt - z_b) / math.tan(dep) if alt > z_b else 0.0
-        return max(0.0, r - closest)
-
-    def _safe_to_descend(self, ctx: Ctx, new_alt: float, margin_m: float = 0.3, near_m: float = 0.45) -> bool:
-        """No known furniture under/next to the drone whose top would come within margin_m. The downward
-        ToF only sees what is straight below, not a chair back 20 cm to the side."""
-        pose = ctx.odom.pose
-        heights = ctx.cfg.perception.object_heights_m
-        for o in ctx.memory.objects:
-            h = heights.get(o.cls)
-            if h is None or o.cls in ("person", ctx.target_cls):
-                continue
-            if pose.distance_to(*o.xy) < FOOTPRINT.get(o.cls, 0.3) + near_m and new_alt < h + margin_m:
-                self.status = f"not descending: {o.cls} below/next to us"
-                return False
-        g = ctx.grid
-        c = g.idx(pose.x, pose.y)
-        if c is not None:
-            r = int(near_m / g.cell) + 1
-            i0, j0 = c
-            for i in range(max(0, i0 - r), min(g.n, i0 + r + 1)):
-                for j in range(max(0, j0 - r), min(g.n, j0 + r + 1)):
-                    if g.blocks((i, j), new_alt, clearance_m=margin_m):
-                        self.status = "not descending: obstacle nearby would be too close below"
-                        return False
-        return True
-
-    def _arrive(self, ctx: Ctx, t: TargetObs, overfly: bool = True) -> str:
-        self.final = t
-        self.status = f"arrived: target {t.range_m if t.range_m is None else round(t.range_m, 2)} m ahead"
-        alt = ctx.altitude
-        r = t.range_m if t.range_m is not None else 0.6  # no size-based range: its box is cut, it is close
-        overfly = overfly and not self.person_target  # never fly over a person's head
-        plan = self._overfly_plan(ctx, r, self._top_height(ctx, t, r, alt)) if (overfly and alt is not None) else None
+    def _plan(self, ctx: Ctx, xy: tuple[float, float]) -> list[tuple[Discrete, str]]:
+        """Turn to the mapped target, climb over its top if needed, fly past it (a person: stop short)."""
+        c, cls, pose, alt = self.c, ctx.target_cls, ctx.odom.pose, ctx.altitude
+        b = pose.bearing_to(*xy)
+        if self.person_target:
+            dist = pose.distance_to(*xy) - c.person_standoff_m
+        else:
+            dist = pose.distance_to(*xy) + c.overshoot_m
+        h = math.radians(pose.heading_deg + b)
+        end = (pose.x + max(dist, 0.0) * math.cos(h), pose.y + max(dist, 0.0) * math.sin(h))
+        if self._person_near(ctx, (pose.x, pose.y), end, xy if self.person_target else None):
+            self.status = f"a person is between us and the {cls}: staying here"
+            return []
+        plan = []
+        if abs(b) >= 3:
+            plan.append((Discrete("rotate", b), f"turn {b:+.0f} deg to the {cls} on the map"))
+        if not self.person_target and self.last_top is not None and alt is not None:
+            climb = self.last_top + c.overfly_clearance_m - alt
+            room = ctx.cfg.safety.max_altitude_m - 0.1 - alt  # never above the ceiling
+            if climb > 0.05 and room >= c.min_step_m:
+                climb = min(max(climb, c.min_step_m), room)  # the Tello moves at least 20 cm
+                plan.append((Discrete("move", int(round(climb * 100)), "up"), f"climb {climb:.2f} m over the {cls}"))
+        if dist >= c.min_step_m:
+            n = max(1, math.ceil(dist / MAX_MOVE_M))
+            why = (f"fly to {c.person_standoff_m:.1f} m from {cls}" if self.person_target
+                   else f"fly to the {cls} and {c.overshoot_m:.1f} m past it")
+            for _ in range(n):
+                plan.append((Discrete("move", int(round(dist / n * 100)), "forward"), f"{why}: forward {dist / n:.2f} m"))
         if not plan:
-            return SUCCESS
-        self.plan = plan
-        return self._issue(ctx, *self.plan.pop(0))
+            self.status = f"already at the {cls}"
+        return plan
+
+    def _person_near(self, ctx: Ctx, a: tuple[float, float], b: tuple[float, float],
+                     exclude_xy: tuple[float, float] | None) -> bool:
+        """A person ahead within person_clearance_m of the straight path a -> b (exclude_xy: the target person)."""
+        ax, ay = a
+        dx, dy = b[0] - ax, b[1] - ay
+        L2 = dx * dx + dy * dy or 1e-9
+        for px, py in recent_people(ctx, exclude_xy=exclude_xy):
+            u = ((px - ax) * dx + (py - ay) * dy) / L2
+            if u <= 0:
+                continue  # beside or behind the start (we begin ~1 m behind the wearer): not in the way
+            u = min(1.0, u)
+            if math.hypot(px - ax - u * dx, py - ay - u * dy) < self.person_clearance_m:
+                return True
+        return False
 
     def _top_height(self, ctx: Ctx, t: TargetObs, r: float, alt: float) -> float:
         """Height of the target's top above the floor, from its range and the elevation of its box top."""
         cam = ctx.perception.camera.for_frame(*ctx.res.image_size)
         return alt + r * math.tan(math.radians(cam.elevation_deg(t.det.bbox[1], 0.0, t.det.cx)))
-
-    def _overfly_plan(self, ctx: Ctx, r: float, top: float) -> list[tuple[Discrete, str]] | None:
-        """Climb over the object's top and fly r + overshoot straight ahead, past it. None (stay here) when
-        that is not safe."""
-        c, alt, cls = self.c, ctx.altitude, ctx.target_cls
-        if alt is None or r + c.overshoot_m > c.max_overfly_m:
-            return None
-        climb = max(0.0, top + c.overfly_clearance_m - alt)
-        climb = 0.0 if climb == 0.0 else max(climb, c.min_step_m)  # the Tello moves at least 20 cm
-        dist = r + c.overshoot_m
-        pose = ctx.odom.pose
-        why = None
-        if alt + climb > ctx.cfg.safety.max_altitude_m - 0.1:
-            why = "no room to climb over it"
-        elif person_near_path(ctx, dist, self.person_clearance_m) is not None:
-            why = "a person is near the path"
-        elif ctx.grid.clear_distance(pose, pose.heading_deg, dist, unknown_ok_m=dist, altitude_m=alt + climb) < dist:
-            why = "something in the way"
-        if why:
-            self.status += f" (not flying over: {why})"
-            return None
-        plan = [(Discrete("move", int(round(climb * 100)), "up"), f"climb {climb:.2f} m over the {cls}")] if climb else []
-        return plan + [(Discrete("move", int(round(dist * 100)), "forward"), f"fly over the {cls}: forward {dist:.2f} m")]
-
-    def _fail(self, ctx: Ctx, why: str) -> str:
-        self.status = why
-        return FAILURE
-
-    def _lost(self, ctx: Ctx) -> str:
-        mem = ctx.memory.best(ctx.target_cls, confirmed_only=False)
-        pose = ctx.odom.pose
-        last = self.last_seen
-        if (mem is not None and last is not None and self.last_top is not None and ctx.res is not None
-                and last.det.bbox[3] > 0.75 * ctx.res.image_size[1]
-                and pose.distance_to(*mem.xy) <= self.standoff + self.c.tolerance_m + 0.5):
-            # it slipped out of the bottom of the frame as we closed in: fly over where memory puts it
-            b = pose.bearing_to(*mem.xy)
-            if abs(b) > self.c.align_deg:
-                return self._issue(ctx, Discrete("rotate", b), f"target below the frame: turn {b:+.0f} deg to it")
-            plan = self._overfly_plan(ctx, pose.distance_to(*mem.xy), self.last_top)
-            if plan:
-                self.final, self.plan = last, plan
-                return self._issue(ctx, *self.plan.pop(0))
-        if self.lost_since is None:
-            self.lost_since = ctx.now
-        if ctx.now - self.lost_since < 1.5:
-            self.status = "target not in view: waiting"
-            return RUNNING
-        if self.search_tries >= 4:
-            return self._fail(ctx, "target lost")
-        self.search_tries += 1
-        self.lost_since = None
-        # last seen low in the frame: it most likely dropped out of the bottom -> go down before sweeping
-        last = self.last_seen
-        alt = ctx.altitude
-        if (self.search_tries == 1 and last is not None and ctx.res is not None
-                and last.det.bbox[3] > 0.75 * ctx.res.image_size[1] and alt is not None):
-            below = min(v for v in (alt, ctx.clearance) if v is not None)  # alt is not None here
-            down = min(0.5, below - self.min_altitude_m)
-            if down >= 0.2 and self._safe_to_descend(ctx, alt - down):
-                cm = int(down * 100)
-                return self._issue(ctx, Discrete("move", cm, "down"), f"target lost low: descend {cm} cm")
-        obj = ctx.memory.best(ctx.target_cls, confirmed_only=False)
-        pose = ctx.odom.pose
-        if obj is not None and self.search_tries == 1:
-            b = pose.bearing_to(*obj.xy)
-            if abs(b) >= 5:
-                return self._issue(ctx, Discrete("rotate", b), f"target lost: turn {b:+.0f} deg toward memory")
-        sweep = self.c.reacquire_scan_deg * (1 if self.search_tries % 2 else -2)
-        return self._issue(ctx, Discrete("rotate", sweep), f"target lost: sweep {sweep:+d} deg")

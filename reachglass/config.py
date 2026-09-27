@@ -190,7 +190,7 @@ class ExploreCfg:
 
 @dataclass
 class ApproachCfg:
-    standoff_m: float = 1.3  # last measurement this far from the target, then the fly-over:
+    standoff_m: float = 1.3  # only a fallback (guidance when the map has no target); the approach flies to the map:
     person_standoff_m: float = 1.5  # stop distance when the target IS a person ("find arthur"): no fly-over
     overfly_clearance_m: float = 0.5  # climb (if needed) to this far above the object's top...
     overshoot_m: float = 0.2  # ...and fly this far past its estimated position: hover just beyond it
