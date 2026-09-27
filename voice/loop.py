@@ -96,7 +96,7 @@ class VoiceApp:
         self._quiet_until = 0.0
 
         def paused() -> bool:
-            if self.speaker.busy():
+            if self.speaker.busy:
                 self._quiet_until = time.time() + 0.6  # hangover: don't catch our own tail
                 return True
             return time.time() < self._quiet_until
