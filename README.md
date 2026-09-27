@@ -164,6 +164,18 @@ current pose as they walk. The drone can keep estimating that pose with the pers
 next to the target facing the room). The glasses' L/R cues then come from that turn angle, plus the
 glasses camera once the target is in view.
 
+**The glasses hardware exists and is in [`firmware/`](firmware/).** Two boards: an ESP32-CAM hosting a
+WiFi access point and serving MJPEG, and an Arduino Nano ESP32 running two VL53L0X range sensors and
+two servos that press haptic pads into the wearer's temples.
+
+- **Writing perception or guidance code?** Read [`firmware/HARDWARE_INTERFACE.md`](firmware/HARDWARE_INTERFACE.md).
+  It is the black-box contract: you get a `FrameSource` plus two distances in mm, and you send
+  `-1` / `0` / `+1` for left / nothing / right. Nothing else to learn.
+- **Wiring or flashing the boards?** Read [`firmware/README.md`](firmware/README.md).
+
+One thing worth knowing before you write against it: **the pad sides are crossed.** `+1` (go right)
+presses the LEFT pad, so the wearer is nudged from the far side toward where they should go.
+
 ## 9. Optional: fruit fly steering
 
 The fruitfly-training team's connectome controller (`flyfollow.steer.FlySteer`, 1,446 LIF neurons from the
