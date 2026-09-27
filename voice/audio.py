@@ -118,13 +118,30 @@ class Recorder:
         tick() runs every block (~50 ms) for the caller's housekeeping. Ctrl+C to stop."""
         import sounddevice as sd
 
-        idx, name = find_input_device(self.input_substr)
-        if idx is None:
-            print(f"[audio] no '{self.input_substr}' input found -> using {name}")
         q: queue.Queue[np.ndarray] = queue.Queue()
 
         def callback(indata, frames, t, status):
             q.put(indata[:, 0].copy())
+
+        def open_stream() -> sd.InputStream:
+            """Wait for a usable input device instead of crashing: the AirPods may connect
+            (or re-resolve after a profile flip) after the app starts. Device indices are
+            re-queried on every attempt -- they shift when Bluetooth reconnects."""
+            while True:
+                idx, name = find_input_device(self.input_substr)
+                if idx is None:
+                    print(f"[audio] no '{self.input_substr}' input found -> trying {name}")
+                try:
+                    s = sd.InputStream(samplerate=self.rate, channels=1, dtype="float32",
+                                       device=idx, blocksize=int(self.rate * 0.05),
+                                       callback=callback)
+                    s.start()
+                    return s
+                except (sd.PortAudioError, ValueError) as e:
+                    print(f"[audio] no usable microphone ({e}); is the AirPods' mic connected? retrying in 3 s")
+                    if tick is not None:
+                        tick()
+                    time.sleep(3.0)
 
         blocks: list[np.ndarray] = []
         speaking = False
@@ -132,15 +149,20 @@ class Recorder:
         noise = 0.002  # adaptive floor: EMA of the RMS while nobody is talking. The fixed
         # push-to-talk threshold (silence_rms 0.010) needs a raised voice on the AirPods'
         # HFP mic; hands-free triggers a factor above the ACTUAL room floor instead.
-        with sd.InputStream(samplerate=self.rate, channels=1, dtype="float32",
-                            device=idx, blocksize=int(self.rate * 0.05),
-                            callback=callback):
+        stream = open_stream()
+        try:
             while True:
                 if tick is not None:
                     tick()
                 try:
                     pending = [q.get(timeout=0.5)]
                 except queue.Empty:
+                    if not stream.active:  # Bluetooth dropped mid-session: reopen, don't go deaf
+                        print("[audio] input stream died (Bluetooth drop?): reopening")
+                        stream.close()
+                        blocks.clear()
+                        speaking, quiet_s = False, 0.0
+                        stream = open_stream()
                     continue
                 while True:  # drain: if tick() ever runs long, catch up instead of lagging behind
                     try:
@@ -172,6 +194,8 @@ class Recorder:
                     speaking, quiet_s = False, 0.0
                 elif not speaking and sum(b.size for b in blocks) > self.rate * 1.0:
                     del blocks[:-4]  # keep only a short pre-roll while nobody is talking
+        finally:
+            stream.close()
 
 
 def play(data: np.ndarray, rate: int = 16000) -> None:
