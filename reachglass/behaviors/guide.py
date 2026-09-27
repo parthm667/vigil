@@ -19,9 +19,10 @@
           new obstacle lands on it. Cue 2 once they are within reach of the target -> SUCCESS.
           GLASSES (glasses.enabled, object targets). ONE camera guides at a time, and nothing gives up:
           the glasses camera is not touched until the drone measures the wearer within handoff_m of the
-          target AND facing within handoff_facing_deg of it. Then its stream opens (and stays open) while the
-          drone keeps guiding; once frames arrive, the glasses take over and the drone's camera is no longer
-          used (perception idle). Cues come from the target's bearing in the glasses camera (the wearer's
+          target, OR facing within handoff_facing_deg of it (within handoff_far_m), OR it has not seen the
+          wearer for handoff_unseen_s (they are probably under it). Then its stream opens (and stays open)
+          while the drone keeps guiding; once frames arrive, the glasses take over and the drone's camera is
+          no longer used (perception idle). Cues come from the target's bearing in the glasses camera (the wearer's
           point of view), which corrects the map's error at the end; arrived = its distance within the same
           reach the drone would have used. Not seen by the glasses for glasses_lost_s (or no frames): back to
           the drone's camera, and the glasses are tried again after glasses_retry_s. No time limit.
@@ -142,10 +143,16 @@ class Guide(Behavior):
     # ------------------------------------------------------------------ main
     def step(self, ctx: Ctx) -> str:
         r = self._step(ctx)
-        if r != RUNNING and self.gv is not None:
-            self.gv.close()  # the CAM serves one stream client: let it go
-            self.gv = Guide._live_view = None
+        if r != RUNNING:
+            self.close()
         return r
+
+    def close(self) -> None:
+        """Let the glasses stream go (the CAM serves one client). Also called by the mission when it leaves GUIDE
+        some other way ("land", "follow me", "stop")."""
+        if self.gv is not None:
+            self.gv.close()
+            self.gv = Guide._live_view = None
 
     def _step(self, ctx: Ctx) -> str:
         c = self.c
@@ -318,18 +325,11 @@ class Guide(Behavior):
                     self._replan_if_needed(ctx, bool(ctx.res.ran.get("context")))
                     err, self.seg, _ = steer(self.path.points, self.person_xy, self.heading, self.seg, c.lookahead_m,
                                              final_xy=self.target)
-                    if (self.can_glasses and self.last_d_target <= c.handoff_m
-                            and abs(wrap_deg(self.heading - _heading_to(self.person_xy, self.target)))
-                            <= c.handoff_facing_deg):
-                        if self.gv is None:  # first time in range and facing it: open the stream, keep it open
-                            self.gv = Guide._live_view = GlassesTargetView(
-                                ctx.cfg.glasses, ctx.perception.detectors["target"], ctx.target_cls,
-                                ctx.cfg.perception.object_heights_m.get(ctx.target_cls), c.glasses_stride)
-                            ctx.note("guide: in range and facing it: opening the glasses camera (the drone guides meanwhile)")
-                            print(f"[guide] {self.last_d_target:.1f} m out and facing the target: opening the "
-                                  f"ESP32 glasses camera (drone keeps guiding until frames arrive)", flush=True)
-                        elif ctx.now >= self.g_retry_at and self.gv.streaming():
-                            self._to_glasses(ctx, f"{self.last_d_target:.1f} m away and facing it")
+                    facing = abs(wrap_deg(self.heading - _heading_to(self.person_xy, self.target))) <= c.handoff_facing_deg
+                    if self.can_glasses and (self.last_d_target <= c.handoff_m
+                                             or (facing and self.last_d_target <= c.handoff_far_m)):
+                        why = "in range" if self.last_d_target <= c.handoff_m else "facing it"
+                        if self._try_glasses(ctx, f"{why}, {self.last_d_target:.1f} m away"):
                             return RUNNING
                     cue = cue_from_error(err, self.cue, c.forward_deg, c.forward_exit_deg)
                     self._send(ctx, cue, f"{self.last_d_target:.1f} m to go, turn {err:+.0f} deg "
@@ -344,6 +344,10 @@ class Guide(Behavior):
             self._send(ctx, ARRIVED_CUE, f"arrived: out of view {self.last_d_target:.2f} m from the {ctx.target_cls}",
                        force=True)
             return SUCCESS  # too close to the drone to measure (they fill the frame), still walking in
+        # the drone lost the wearer: they are probably under it, where only the glasses can still see the target
+        if self.can_glasses and unseen > c.handoff_unseen_s and self._try_glasses(
+                ctx, f"the drone has not seen the wearer for {unseen:.1f} s"):
+            return RUNNING
         if unseen > c.lost_timeout_s:
             self.status = f"lost the wearer for {unseen:.0f} s"
             return FAILURE
@@ -355,20 +359,38 @@ class Guide(Behavior):
         self._repeat_cue(ctx)
         return RUNNING
 
+    def _try_glasses(self, ctx: Ctx, why: str) -> bool:
+        """A switch condition holds: open the glasses stream the first time (it then stays open; the drone guides
+        meanwhile), switch once it delivers frames and the retry pause is over. True = switched now."""
+        if self.gv is None:
+            c = self.c
+            self.gv = Guide._live_view = GlassesTargetView(
+                ctx.cfg.glasses, ctx.perception.detectors["target"], ctx.target_cls,
+                ctx.cfg.perception.object_heights_m.get(ctx.target_cls), c.glasses_stride)
+            self._say(ctx, f"guide: {why}: opening the glasses camera (the drone guides meanwhile)")
+            return False
+        if ctx.now >= self.g_retry_at and self.gv.streaming():
+            self._to_glasses(ctx, why)
+            return True
+        return False
+
+    @staticmethod
+    def _say(ctx: Ctx, text: str) -> None:
+        ctx.note(text)
+        print(text, flush=True)  # camera switches on the console too (notes only go to the run log)
+
     def _to_glasses(self, ctx: Ctx, why: str) -> None:
         """Hand the guiding to the glasses camera (its stream is already delivering frames)."""
         ctx.perception.set_mode("idle")  # no detector runs on the drone's frames while the glasses guide
         self.glasses_mode, self.g_seen_t, self.g_arrive = True, ctx.now, 0  # g_seen_t: time to find it
-        ctx.note(f"guide: switching to the glasses camera ({why}); the drone's camera is no longer used")
-        print(f"[guide] SWITCHED to the ESP32 glasses camera ({why}); drone camera idle", flush=True)
+        self._say(ctx, f"guide: switching to the glasses camera ({why}); the drone's camera is no longer used")
 
     def _to_drone(self, ctx: Ctx, why: str) -> None:
         """Back to the drone's camera; the glasses are tried again after glasses_retry_s (never given up)."""
         self.glasses_mode, self.g_retry_at = False, ctx.now + self.c.glasses_retry_s
         self.miss_since = None  # the drone was not looking meanwhile: not "unseen" for all that time
         ctx.perception.set_mode("guide")
-        ctx.note(f"guide: {why}: back to the drone's camera (the glasses will be tried again)")
-        print(f"[guide] back to the DRONE camera ({why}); glasses retried in {self.c.glasses_retry_s:.0f} s", flush=True)
+        self._say(ctx, f"guide: {why}: back to the drone's camera (the glasses will be tried again)")
 
     def _step_glasses(self, ctx: Ctx) -> str:
         """After the handoff, the only camera: cue from the target's bearing in the glasses camera; arrived once

@@ -2,8 +2,9 @@
 
 The search already located it (semantic memory, from the scans). No re-measuring, no re-searching:
   1. turn to the mapped position
-  2. go to travel_altitude_m (1.5 m) above the floor; re-levelled before every later forward move and on
-     arrival (moves are relative and the Tello drifts, e.g. rising over a table), so it travels and ends there
+  2. go to travel_altitude_m (1.5 m) above the floor; re-levelled before every later forward move (moves are
+     relative and the Tello drifts, e.g. rising over a table); once over the target: over_object_m (0.75 m)
+     above its measured top (a person, or a top never measured: stay at travel_altitude_m)
   3. fly forward distance + overshoot_m (in moves of at most 4 m): the drone ends just past the target
 The target IS a person ("find arthur"): no climb, no fly-over; stop person_standoff_m short of them, and
 their own position does not count as a person in the way.
@@ -22,6 +23,7 @@ from .base import FAILURE, RUNNING, SUCCESS, Behavior, Ctx, Discrete
 
 MAX_MOVE_M = 4.0  # the Tello's move command takes at most 5 m
 LEVEL = "level"  # plan step: move to travel_altitude_m, computed when it is reached
+LEVEL_OVER = "level_over"  # plan step, last: move to over_object_m above the target's top
 
 
 def observe_people(ctx: Ctx) -> None:
@@ -136,26 +138,34 @@ class Approach(Behavior):
                 return SUCCESS
         while self.plan:
             item = self.plan.pop(0)
-            if item == LEVEL:
-                item = self._level(ctx)  # computed now, from the altitude now
+            if item == LEVEL or item == LEVEL_OVER:  # computed now, from the altitude now
+                item = self._level(ctx, self._over_altitude(ctx) if item == LEVEL_OVER else self.c.travel_altitude_m)
                 if item is None:
-                    continue  # already within 10 cm of travel_altitude_m
+                    continue  # already within 10 cm of it
             self.cmd, self.status = item
             ctx.note(f"approach: {self.status}")
             return RUNNING
         self.status = f"{'next to' if self.person_target else 'over'} the {cls}"
         return SUCCESS
 
-    def _level(self, ctx: Ctx) -> tuple[Discrete, str] | None:
-        """A move to travel_altitude_m above the floor, or None when already within 10 cm of it. The Tello moves
-        at least 20 cm: 10-20 cm off moves 20 cm, which still ends within 10 cm."""
-        alt, want = ctx.altitude, self.c.travel_altitude_m
+    def _over_altitude(self, ctx: Ctx) -> float:
+        """Height above the floor once over the target: over_object_m above its measured top, within the safety
+        band (never over a person, or when its top was never measured: travel_altitude_m)."""
+        c, s = self.c, ctx.cfg.safety
+        if self.person_target or self.last_top is None:
+            return c.travel_altitude_m
+        return min(max(self.last_top + c.over_object_m, s.min_altitude_m + 0.2), s.max_altitude_m - 0.2)
+
+    def _level(self, ctx: Ctx, want: float) -> tuple[Discrete, str] | None:
+        """A move to `want` m above the floor, or None when already within 10 cm of it. The Tello moves at least
+        20 cm: 10-20 cm off moves 20 cm, which still ends within 10 cm."""
+        alt = ctx.altitude
         if alt is None or abs(want - alt) < 0.1:
             return None
         up = want > alt
         cm = max(int(round(self.c.min_step_m * 100)), int(round(abs(want - alt) * 100)))
         return (Discrete("move", cm, "up" if up else "down"),
-                f"{'climb' if up else 'descend'} {cm} cm to {want:.1f} m for the trip")
+                f"{'climb' if up else 'descend'} {cm} cm to {want:.2f} m")
 
     def _plan(self, ctx: Ctx, xy: tuple[float, float]) -> list:
         """Level at travel_altitude_m, turn to the mapped target, fly past it (a person: stop short); re-level
@@ -182,7 +192,7 @@ class Approach(Behavior):
                 if k:
                     plan.append(LEVEL)
                 plan.append((Discrete("move", int(round(dist / n * 100)), "forward"), f"{why}: forward {dist / n:.2f} m"))
-        plan.append(LEVEL)  # and stay at travel_altitude_m once there
+        plan.append(LEVEL_OVER)  # over it: over_object_m above its top
         return plan
 
     def _person_near(self, ctx: Ctx, a: tuple[float, float], b: tuple[float, float],

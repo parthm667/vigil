@@ -86,10 +86,13 @@ class Mission:
         return cls.capitalize() if self._is_name(cls) else f"your {cls}"
 
     def _go(self, state: str, why: str = "", child: Behavior | None = None) -> None:
-        if self.state == "GUIDE" and state != "GUIDE":  # however guiding ends: no pad may stay pressed
+        if self.state == "GUIDE" and state != "GUIDE":  # however guiding ends: no pad may stay pressed...
             release = getattr(self.cue_fn, "release", None)
             if release is not None:
                 release()
+            close = getattr(self.child, "close", None)  # ...and the glasses stream stops
+            if close is not None:
+                close()
         self.state, self.state_t = state, self.ctx.now
         self.history.append((self.ctx.now, state, why))
         self.ctx.note(f"-> {state} {why}")

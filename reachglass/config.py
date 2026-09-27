@@ -192,7 +192,8 @@ class ExploreCfg:
 class ApproachCfg:
     standoff_m: float = 1.3  # only a fallback (guidance when the map has no target); the approach flies to the map:
     person_standoff_m: float = 1.5  # stop distance when the target IS a person ("find arthur"): no fly-over
-    travel_altitude_m: float = 1.5  # height above the floor while flying to the found target (and on arrival)
+    travel_altitude_m: float = 1.5  # height above the floor while flying to the found target...
+    over_object_m: float = 0.75  # ...then, over it, this far above its measured top (unmeasured: stay at travel)
     overshoot_m: float = 0.2  # ...and fly this far past its estimated position: hover just beyond it
     max_overfly_m: float = 2.5  # longest blind leg (the camera cannot see below once over it)
     tolerance_m: float = 0.25
@@ -249,8 +250,10 @@ class GuideCfg:
     cue_hz: float = 4.0  # repeat the current cue this often (and at once when it changes)
     # the last metres on the glasses camera (needs glasses.enabled; object targets only, not a person):
     glasses_handoff: bool = True
-    handoff_m: float = 2.5  # the drone measures the wearer this close to the target AND...
-    handoff_facing_deg: float = 30.0  # ...facing within this of it -> glasses camera only (never before, never back)
+    handoff_m: float = 2.5  # to the glasses camera: the drone measures the wearer this close to the target, OR...
+    handoff_facing_deg: float = 30.0  # ...facing within this of it, unless farther than...
+    handoff_far_m: float = 5.0  # ...this, OR...
+    handoff_unseen_s: float = 1.0  # ...the drone has not seen the wearer this long (probably under it)
     glasses_stride: int = 3  # detector on every Nth glasses frame (~4 Hz at 12 fps)
     glasses_forward_deg: float = 8.0  # glasses cue 0 (forward) below this bearing, kept until...
     glasses_forward_exit_deg: float = 15.0  # ...it exceeds this
@@ -261,7 +264,7 @@ class GuideCfg:
     # the arrival distance + lost_close_m, then unmeasurable for lost_close_s (still walking in) -> arrived
     lost_close_m: float = 0.7
     lost_close_s: float = 0.5
-    lost_timeout_s: float = 30.0  # not seen this long: give up (the mission lands)
+    lost_timeout_s: float = 30.0  # the drone has not seen the wearer this long: stop guiding (the drone hovers)
     max_s: float = 300.0
 
 
