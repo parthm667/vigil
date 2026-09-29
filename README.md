@@ -162,31 +162,8 @@ open x (0.3 + novelty) x semantic prior (bottles live on tables...) x people pen
 Next it hops at most 1.5 m. Free space comes only from evidence: an object seen at 3 m proves the line
 of sight to it is clear. Unknown directions get a cautious 0.5 m step.
 
-## 7. Known limits (be honest in the demo)
 
-- **Walls are invisible** unless something is seen beyond them. There is no forward range sensor, and
-  monocular depth (Depth-Anything) proved unreliable here: it is kept as an experimental slot, off by default.
-  Hops are short and the room should be clear. Keep a spotter.
-- **Following 1 m behind at 2 m** (the default) sees only the wearer's **head**: the camera cannot tilt, and
-  their shoulders are 29 deg below its view. So there is no facing estimate and no orbiting behind them when
-  they turn, YOLO must recognise a person from the top of a head, and they drop out of view entirely when
-  closer than ~0.85 m. If they walk toward the drone it backs off, and if they vanish while close it backs
-  off sideways and climbs. `follow: {distance_m: 1.6}` puts the shoulders back in view (facing, orbit, more
-  margin) if the dry run shows head-only detection is unreliable.
-- **Person range** depends on the configured wearer height (see step 4). The follow controller only moves
-  toward the person when even the most conservative estimate agrees.
-- **Facing** comes from YOLO-pose's left/right shoulder labels, cross-checked with face visibility and
-  smoothed. Test it on the real wearer seen from behind (dry run) before relying on the orbit.
-- Target distance comes from its size: far away with its bottom hidden, it reads long. The approach
-  re-measures at every step, so it still arrives.
-- The Tello's downward sensor makes it hold height above whatever is below it. The stack uses
-  floor-referenced height for decisions, and treats furniture reaching within 0.2 m of flight height as an
-  obstacle (it passes over chair backs at 1.2 m, not over a TV on a stand). When furniture blocks the way it sidesteps, or stops
-  where the furniture allows.
-- People: the approach never flies within 1 m of a person. That includes where the wearer stood when they
-  asked, because the drone starts behind them and they are often between the drone and the target.
-
-## 8. Next stage: guiding the person
+## 7. Next stage: guiding the person
 
 `Mission.guidance` (see `mission/guidance.py`) holds the target and the person's position and heading in
 the mission frame. `guidance.relative_to(x, y, heading)` gives the distance and turn from the person's
@@ -206,7 +183,7 @@ two servos that press haptic pads into the wearer's temples.
 One thing worth knowing before you write against it: **the pad sides are crossed.** `+1` (go right)
 presses the LEFT pad, so the wearer is nudged from the far side toward where they should go.
 
-## 9. Optional: fruit fly steering
+## 8. Fruit fly steering
 
 The fruitfly-training team's connectome controller (`flyfollow.steer.FlySteer`, 1,446 LIF neurons from the
 fruit fly's pursuit circuit) can decide the **yaw stick** in FOLLOW and APPROACH. Everything else stays ours:
