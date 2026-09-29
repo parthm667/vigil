@@ -20,21 +20,7 @@ python tools/download_models.py        # YOLO (+pose, +World), Depth-Anything; t
 python -m pytest                        # ~200 tests, ~4 min (unit tests + closed-loop simulations)
 ```
 
-## 2. See the whole mission on the simulator (no drone)
-
-```bash
-python -m reachglass sim --query "can you find my water bottle" --at 25
-```
-
-The dashboard shows the drone camera with detections, a live map and the mission state. You can also type
-requests in the terminal: `find my water bottle`, `follow me`, `what's around me`, `stop`, `land`.
-Add `--headless --record run.mp4` to save a video instead of opening a window.
-
-The simulator renders the room, and the **real** colour-blob detector finds the dummy in those frames. People
-and furniture come from "oracle" detectors (YOLO cannot recognise rendered boxes), with realistic faults:
-noise, dropouts, and left/right keypoint swaps.
-
-## 3. On site, before the first flight (about 20 minutes)
+## 2. On site, before the first flight (about 20 minutes)
 
 1. **Latency / sign check.** Run `python tools/tello_latency_test.py --ground`, then the flight version.
    - Set `drone.video_lag_s` to the measured video delay plus a margin. After a turn or move, frames are only
@@ -85,7 +71,7 @@ follow: {altitude_m: 2.0, distance_m: 1.0}
 safety: {max_altitude_m: 2.3}           # below your ceiling
 ```
 
-## 4. The voice app (AirPods Pro 2 on Windows 11)
+## 3. The voice app (AirPods Pro 2 on Windows 11)
 
 ```
 .venv\Scripts\pip install -r requirements-voice.txt    # once, separate from the flight deps
@@ -112,7 +98,7 @@ actually find, so an unknown object gets "I can't look for keys yet" instead of 
 `query.LLMQueryParser` plugs in any language model (Grok, etc.) behind the same interface and rejects
 answers outside the vocabulary.
 
-## 4b. Finding people by name ("find arthur")
+## 3b. Finding people by name ("find arthur")
 
 One photo per teammate in `people/` (`arthur.jpg` -> the drone knows "arthur"), then:
 ```
@@ -127,7 +113,7 @@ left") and hovers. Identity is verified on person-box crops (insightface SCRFD+A
 in `site.yaml` is the zero-install fallback) and sticks to the track between checks. Faces are readable
 to roughly 3.5-4 m through the Tello camera -- have people face the drone in the demo.
 
-## 5. Switching the bottle detector
+## 4. Switching the bottle detector
 
 - Check it live first: `python -m reachglass.tools.target_view tello --config site.yaml` (boxes, confidence,
   distance, ms/frame).
@@ -142,7 +128,7 @@ perception:
   object_widths_m: {bottle: 0.09}
 ```
 
-## 6. How it works (and what to swap)
+## 5. How it works (and what to swap)
 
 | Module | What it does | Swap / tune |
 |---|---|---|
@@ -163,7 +149,7 @@ Next it hops at most 1.5 m. Free space comes only from evidence: an object seen 
 of sight to it is clear. Unknown directions get a cautious 0.5 m step.
 
 
-## 7. Next stage: guiding the person
+## 6. Next stage: guiding the person
 
 `Mission.guidance` (see `mission/guidance.py`) holds the target and the person's position and heading in
 the mission frame. `guidance.relative_to(x, y, heading)` gives the distance and turn from the person's
@@ -183,7 +169,7 @@ two servos that press haptic pads into the wearer's temples.
 One thing worth knowing before you write against it: **the pad sides are crossed.** `+1` (go right)
 presses the LEFT pad, so the wearer is nudged from the far side toward where they should go.
 
-## 8. Fruit fly steering
+## 7. Fruit fly steering
 
 The fruitfly-training team's connectome controller (`flyfollow.steer.FlySteer`, 1,446 LIF neurons from the
 fruit fly's pursuit circuit) can decide the **yaw stick** in FOLLOW and APPROACH. Everything else stays ours:
@@ -204,3 +190,17 @@ fly:
 ```
 If `flyfollow` is missing or the fly fails, the behaviour logs one warning and uses our yaw law.
 Details and sim numbers: `docs/integration/REACHGLASS.md` in fruitfly-training.
+
+## 8. See the whole mission on the simulator (no drone) [CURRENTLY BROKEN, NEED TO REMAKE THE SIM]
+
+```bash
+python -m reachglass sim --query "can you find my water bottle" --at 25
+```
+
+The dashboard shows the drone camera with detections, a live map and the mission state. You can also type
+requests in the terminal: `find my water bottle`, `follow me`, `what's around me`, `stop`, `land`.
+Add `--headless --record run.mp4` to save a video instead of opening a window.
+
+The simulator renders the room, and the **real** colour-blob detector finds the dummy in those frames. People
+and furniture come from "oracle" detectors (YOLO cannot recognise rendered boxes), with realistic faults:
+noise, dropouts, and left/right keypoint swaps.
