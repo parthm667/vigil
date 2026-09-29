@@ -1,5 +1,8 @@
 # ReachGlass: scout-drone perception and mission stack
 
+### Result: 3rd Overall (out of 268) at HackGT 13
+### Demo/Presentation: https://youtu.be/AqV3zwgGGPI
+
 A DJI Tello (standard model) hovers **behind and above the wearer's head**. When it gets a text request
 ("can you find my water bottle?") it drops to search height, explores the room, finds the object, flies
 up to it, and works out where the object is **relative to where the person stood and which way they faced**.
