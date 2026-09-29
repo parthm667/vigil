@@ -1,6 +1,6 @@
 # ReachGlass: scout-drone perception and mission stack
 
-### Result: 3rd Overall (out of 268) at HackGT 13
+### Result: 🏆 3rd Overall (out of 268) at HackGT 13
 ### Demo/Presentation: https://youtu.be/AqV3zwgGGPI
 
 A DJI Tello (standard model) hovers **behind and above the wearer's head**. When it gets a text request
